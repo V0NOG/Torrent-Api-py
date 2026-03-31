@@ -1,0 +1,396 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+  <title>Torrent Requests</title>
+  <link rel="stylesheet" href="/app.css" />
+</head>
+<body>
+
+  <!-- LOGIN SCREEN (shown when not authenticated) -->
+  <div id="loginScreen" class="loginScreen" style="display:none;">
+    <div class="loginBox">
+      <div class="brand" style="margin-bottom:24px;">
+        <div class="logo"></div>
+        <div>
+          <h1>Torrent Requests</h1>
+          <div class="sub">Sign in to continue</div>
+        </div>
+      </div>
+
+      <div class="field">
+        <label class="mini">Username</label>
+        <input id="loginUser" type="text" placeholder="jellyfin username" autocomplete="username" />
+      </div>
+      <div class="field">
+        <label class="mini">Password</label>
+        <input id="loginPass" type="password" placeholder="password" autocomplete="current-password" />
+      </div>
+      <div id="loginError" class="mini" style="color:var(--red); min-height:18px; margin-bottom:4px;"></div>
+      <button id="loginBtn" class="btn primary" style="width:100%; padding:14px; font-size:16px; margin-top:4px;">Sign In</button>
+    </div>
+  </div>
+
+  <!-- MAIN APP (shown when authenticated) -->
+  <div id="appShell" style="display:none;">
+
+    <div class="topbar">
+      <div class="wrap">
+        <div class="brand">
+          <div class="logo"></div>
+          <div>
+            <h1>Torrent Requests</h1>
+            <div class="sub brandSub">Local tester UI • stable ingestion + review</div>
+          </div>
+        </div>
+        <div class="actions">
+          <!-- User info + nav -->
+          <span id="userDisplay" class="pill info" style="font-size:12px;"></span>
+          <button id="filesTabBtn" class="btn" style="display:none;">Files</button>
+          <button id="searchTabBtn" class="btn">Search</button>
+          <button id="sitesTabBtn" class="btn">Sites</button>
+          <button id="logoutBtn" class="btn">Sign Out</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- SEARCH TAB -->
+    <div id="searchTab" class="wrap">
+      <div class="grid">
+        <div class="card primary-card">
+          <h2 class="title">Search</h2>
+          <p class="hint">Search torrents and queue magnets into Transmission. Review becomes available only when download is truly finished.</p>
+
+          <div id="adminOnlySearch" style="display:none;">
+            <div class="field">
+              <label class="mini">API Key (required for downloads + queue)</label>
+              <div class="row">
+                <input id="apiKey" type="password" placeholder="API key" autocomplete="off" />
+                <button id="saveKey" type="button" class="btn primary">Save API Key</button>
+              </div>
+            </div>
+          </div>
+
+          <div id="ndCredsField" class="field" style="display:none;">
+            <label class="mini">Navidrome Account <span class="mini" style="color:var(--muted); font-weight:400;">(for audiobook playlists)</span></label>
+            <div class="row" style="gap:8px; flex-wrap:wrap;">
+              <input id="ndUser" placeholder="Navidrome username" autocomplete="username" style="flex:1; min-width:120px;" />
+              <input id="ndPass" type="password" placeholder="Navidrome password" autocomplete="current-password" style="flex:1; min-width:120px;" />
+              <button id="saveNd" type="button" class="btn primary">Save</button>
+            </div>
+            <div id="ndSaveHint" class="mini" style="color:var(--muted); min-height:16px; margin-top:4px;"></div>
+          </div>
+
+          <div class="field">
+            <label class="mini">Site</label>
+            <div class="row">
+              <select id="site" class="btn" style="flex:1;"></select>
+              <select id="limit" class="btn" style="width:120px;">
+                <option>5</option>
+                <option selected>10</option>
+                <option>20</option>
+                <option>50</option>
+                <option>100</option>
+              </select>
+            </div>
+            <div class="mini" style="margin-top:8px;color:var(--muted);">
+              Destination type is chosen during <b>Review</b> (Movies / TV / Music / Other).
+            </div>
+          </div>
+
+          <div class="field">
+            <label class="mini">Query</label>
+            <input id="q" placeholder="e.g., ubuntu 24.04 iso" />
+          </div>
+
+          <div class="searchButtonRow">
+            <button id="go" class="btn primary">Search</button>
+          </div>
+
+          <div style="margin-top:12px;" id="status"></div>
+          <div class="results" id="results"></div>
+        </div>
+
+        <div class="stack">
+          <div id="adminQueueCard" class="card" style="display:none;">
+            <h2 class="title">Download Queue</h2>
+            <p class="hint">Live status from Transmission (auto-refreshes). Review is enabled only when state + percent indicate completion.</p>
+            <div id="queueStatus" class="mini" style="margin-bottom:10px; color: var(--muted);"></div>
+            <div id="queue" class="queue"></div>
+          </div>
+
+          <div id="adminNotesCard" class="card" style="display:none;">
+            <h2 class="title">Notes</h2>
+            <p class="hint">Moves create destination directories before moving files. Review controls exactly what is kept/deleted.</p>
+            <button id="rescanBtn" class="btn" style="width:100%;">Rescan Library (Jellyfin + Navidrome)</button>
+            <div id="rescanHint" class="mini" style="margin-top:8px;color:var(--muted);"></div>
+          </div>
+
+          <div class="card">
+            <h2 class="title">Status</h2>
+            <p class="hint">Live service health — checked server-side.</p>
+            <div id="servicesBox" class="mini" style="color:var(--muted);">Loading…</div>
+            <div style="margin-top:12px;">
+              <a class="btn" href="http://127.0.0.1:9091/transmission/web/" target="_blank" rel="noreferrer">Open Transmission</a>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- FILE MANAGER TAB -->
+    <div id="filesTab" class="wrap" style="display:none;">
+      <div class="card">
+        <div style="display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:14px; flex-wrap:wrap;">
+          <div>
+            <h2 class="title" style="margin:0;">File Manager</h2>
+            <div class="mini" style="color:var(--muted); margin-top:4px;" id="fmPathDisplay">Loading…</div>
+          </div>
+          <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
+            <input id="fmSearchInput" placeholder="Search files…" style="min-width:160px;" />
+            <button id="fmSearchBtn" class="btn sm primary">Search</button>
+            <button id="fmRefresh" class="btn sm">Refresh</button>
+            <button id="fmMkdir" class="btn sm">New Folder</button>
+            <button id="fmNavUp" class="btn sm" disabled>↑ Up</button>
+          </div>
+        </div>
+
+        <!-- Root selector (admin sees multiple roots) -->
+        <div id="fmRootRow" style="display:none; margin-bottom:10px;">
+          <label class="mini" style="color:var(--muted); display:block; margin-bottom:6px;">Root</label>
+          <select id="fmRootSelect" class="btn" style="width:100%;"></select>
+        </div>
+
+        <!-- Breadcrumb -->
+        <div id="fmBreadcrumb" class="fmBreadcrumb"></div>
+
+        <!-- File listing -->
+        <div id="fmList" class="fmList">
+          <div class="mini" style="color:var(--muted);">Loading…</div>
+        </div>
+      </div>
+    </div>
+
+  </div><!-- /appShell -->
+
+  <div id="toastHost" class="toastHost"></div>
+
+  <!-- Review/Move modal -->
+  <div id="reviewModal" class="modal" aria-hidden="true">
+    <div class="box">
+
+      <div id="reviewBusy" class="busyOverlay" style="display:none;">
+        <div class="busyCard">
+          <div class="pill info">WORKING</div>
+          <div id="reviewBusyText" class="mini" style="color:var(--muted); margin-top:8px;">Working…</div>
+        </div>
+      </div>
+
+      <div class="modalHeader">
+        <div>
+          <div class="title" style="margin:0;">Review & Move</div>
+          <div id="reviewSub" class="mini" style="color:var(--muted);"></div>
+        </div>
+        <button id="closeReview" class="btn sm">Close</button>
+      </div>
+
+      <div class="reviewGrid" style="margin-top:12px;">
+        <div>
+          <div class="mini" style="color:var(--muted);margin-bottom:6px;">Destination type</div>
+          <select id="destType" class="btn" style="width:100%;">
+            <option value="movies">Movies (Jellyfin Movies)</option>
+            <option value="tv">TV (Jellyfin TV)</option>
+            <option value="music">Music (Navidrome)</option>
+            <option value="other">Other / Custom</option>
+          </select>
+
+          <div id="customDestRow" style="margin-top:10px; display:none;">
+            <div class="mini" style="color:var(--muted);margin-bottom:6px;">Custom subfolder (under /mnt/media)</div>
+            <input id="customSubfolder" placeholder="e.g., Other/Downloads" />
+            <div class="mini" style="margin-top:6px;color:var(--muted);">
+              This becomes: <span class="mono">/mnt/media/&lt;your path&gt;</span>
+            </div>
+          </div>
+
+          <div style="margin-top:12px;">
+            <div class="mini" style="color:var(--muted);margin-bottom:6px;">Options</div>
+            <div class="optStack">
+              <label id="tvAutoSplitRow" class="optRow toggleRow" style="display:none;">
+                <span class="toggle">
+                  <input id="tvAutoSplit" type="checkbox" checked />
+                  <span class="knob" aria-hidden="true"></span>
+                </span>
+                <span class="mini">Auto-split TV seasons into individual Season folders (recommended)</span>
+              </label>
+
+              <label id="musicRunBeetsRow" class="optRow toggleRow" style="display:none;">
+                <span class="toggle">
+                  <input id="musicRunBeets" type="checkbox" checked />
+                  <span class="knob" aria-hidden="true"></span>
+                </span>
+                <span class="mini">For Music: run beets import (recommended)</span>
+              </label>
+
+              <div id="musicLayoutHint" class="mini" style="display:none;color:var(--muted); margin-top:2px;">
+                Suggested layout: <span class="mono">Artist/Album/01 - Track Title.ext</span><br/>
+                If filename parsing fails, files go to <span class="mono">/mnt/media/Music/_incoming</span>
+              </div>
+
+              <div id="musicMetaBox" class="optRow" style="display:none;">
+                <div class="mini" style="color:var(--muted);font-weight:800;margin-bottom:8px;">Music metadata</div>
+                <div class="field" style="margin:0;">
+                  <label class="mini">Mode</label>
+                  <select id="musicKind" class="btn" style="width:100%;">
+                    <option value="music">Music</option>
+                    <option value="audiobook">Audiobook</option>
+                  </select>
+                </div>
+                <div id="musicFields" style="margin-top:10px;">
+                  <div class="grid3">
+                    <div>
+                      <div class="mini" style="color:var(--muted);margin-bottom:6px;">Artist</div>
+                      <input id="musicArtist" placeholder="e.g., Daft Punk" />
+                    </div>
+                    <div>
+                      <div class="mini" style="color:var(--muted);margin-bottom:6px;">Album</div>
+                      <input id="musicAlbum" placeholder="e.g., Discovery" />
+                    </div>
+                    <div>
+                      <div class="mini" style="color:var(--muted);margin-bottom:6px;">Year (optional)</div>
+                      <input id="musicYear" placeholder="2001" inputmode="numeric" />
+                    </div>
+                  </div>
+                </div>
+                <div id="audiobookFields" style="margin-top:10px; display:none;">
+                  <div class="grid3">
+                    <div>
+                      <div class="mini" style="color:var(--muted);margin-bottom:6px;">Author</div>
+                      <input id="abAuthor" placeholder="e.g., Brandon Sanderson" />
+                    </div>
+                    <div>
+                      <div class="mini" style="color:var(--muted);margin-bottom:6px;">Book Name</div>
+                      <input id="abBook" placeholder="e.g., Mistborn" />
+                    </div>
+                    <div>
+                      <div class="mini" style="color:var(--muted);margin-bottom:6px;">Year (optional)</div>
+                      <input id="abYear" placeholder="2006" inputmode="numeric" />
+                    </div>
+                  </div>
+                </div>
+                <div class="mini" style="margin-top:10px;color:var(--muted);">
+                  Music → <span class="mono">/mnt/media/Music/Artist/Album (Year)/</span><br/>
+                  Audiobooks → <span class="mono">/mnt/media/Music/Audiobooks/Author/Book (Year)/</span>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div style="margin-top:12px;">
+            <div class="mini" style="color:var(--muted);margin-bottom:6px;">TMDb Match</div>
+            <select id="matchSelect" class="btn" style="width:100%;"></select>
+            <div class="mini" id="tmdbHint" style="margin-top:6px;color:var(--muted);"></div>
+          </div>
+
+          <div id="nameEditor" style="margin-top:12px;">
+            <div class="mini" style="color:var(--muted);margin-bottom:6px;">Folder name editor</div>
+            <div class="grid3">
+              <div>
+                <div class="mini" style="color:var(--muted);margin-bottom:6px;">Title / Show</div>
+                <input id="titleInput" placeholder="Title" />
+              </div>
+              <div id="yearCol">
+                <div class="mini" style="color:var(--muted);margin-bottom:6px;">Year (optional)</div>
+                <input id="yearInput" placeholder="2025" inputmode="numeric" />
+              </div>
+              <div id="seasonCol" style="display:none;">
+                <div class="mini" style="color:var(--muted);margin-bottom:6px;">Season</div>
+                <input id="seasonInput" type="number" min="1" value="1" />
+              </div>
+            </div>
+            <div style="margin-top:10px;">
+              <div class="mini" style="color:var(--muted);margin-bottom:6px;">Preview destination</div>
+              <div id="reviewDest" class="mono monoBox"></div>
+            </div>
+          </div>
+        </div>
+
+        <div>
+          <div class="mini" style="color:var(--muted);margin-bottom:6px;">Files</div>
+          <div class="filesBox">
+            <div class="filesHdr">
+              <div class="mini" style="color:var(--muted);">Keep</div>
+              <div class="mini" style="color:var(--muted);">Delete</div>
+            </div>
+            <div class="filesCols">
+              <div id="filesKeep" class="filesList"></div>
+              <div id="filesDelete" class="filesList"></div>
+            </div>
+          </div>
+          <div style="margin-top:12px; display:flex; gap:10px; justify-content:flex-end;">
+            <button id="approveMove" class="btn primary">Approve & Move</button>
+          </div>
+          <div class="mini" style="margin-top:8px;color:var(--muted);">
+            Tip: you can toggle any file between Keep/Delete before moving.
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Rename modal -->
+  <div id="renameModal" class="modal" aria-hidden="true">
+    <div class="box" style="max-width:480px;">
+      <div class="modalHeader">
+        <div class="title" style="margin:0;">Rename</div>
+        <button id="closeRename" class="btn sm">Cancel</button>
+      </div>
+      <div style="margin-top:14px;">
+        <div class="mini" style="color:var(--muted); margin-bottom:6px;" id="renameOldName"></div>
+        <input id="renameInput" placeholder="New name" style="margin-top:6px;" />
+        <div class="mini" style="color:var(--red); min-height:18px; margin-top:6px;" id="renameError"></div>
+        <div style="margin-top:14px; display:flex; justify-content:flex-end; gap:10px;">
+          <button id="renameConfirm" class="btn primary">Rename</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Delete confirm modal -->
+  <div id="deleteModal" class="modal" aria-hidden="true">
+    <div class="box" style="max-width:420px;">
+      <div class="modalHeader">
+        <div class="title" style="margin:0; color:var(--red);">Confirm Delete</div>
+        <button id="closeDelete" class="btn sm">Cancel</button>
+      </div>
+      <div style="margin-top:14px;">
+        <div class="mini" style="color:var(--muted); margin-bottom:10px;" id="deleteTargetName"></div>
+        <p style="margin:0; font-size:14px;">This action cannot be undone.</p>
+        <label id="deleteRecursiveRow" class="optRow toggleRow" style="margin-top:14px; display:none;">
+          <span class="toggle">
+            <input id="deleteRecursive" type="checkbox" />
+            <span class="knob" aria-hidden="true"></span>
+          </span>
+          <span class="mini">Delete folder contents recursively</span>
+        </label>
+        <div style="margin-top:14px; display:flex; justify-content:flex-end; gap:10px;">
+          <button id="deleteConfirm" class="btn" style="border-color:rgba(255,69,58,.5); background:rgba(255,69,58,.15); color:var(--red);">Delete</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+    <!-- SITES TAB -->
+    <div id="sitesTab" class="wrap" style="display:none;">
+      <div class="card primary-card">
+        <h2 class="title">Site Status</h2>
+        <p class="hint">All supported torrent sites and their current status. Sites marked "Via Tor" bypass AU ISP blocks automatically.</p>
+        <div id="sitesTabContent">
+          <div class="mini" style="color:var(--muted);">Loading…</div>
+        </div>
+      </div>
+    </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

@@ -6,6 +6,7 @@ import cloudscraper
 import requests
 from bs4 import BeautifulSoup
 from constants.base_url import MAGNETDL
+from helper.proxy_helper import get_requests_proxies
 
 
 class Magnetdl:
@@ -84,7 +85,7 @@ class Magnetdl:
     async def _get_html(self, session, url):
         session = cloudscraper.create_scraper(sess=session)
         try:
-            return session.get(url).text
+            return session.get(url, proxies=get_requests_proxies(url)).text
         except:
             return None
 

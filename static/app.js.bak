@@ -1,0 +1,881 @@
+const API = ""; // same-origin
+
+const SITE_LABELS = {
+  audiobookbay: "AudiobookBay",
+  piratebay: "Pirate Bay",
+  "1337x": "1337x",
+};
+
+function $(id){ return document.getElementById(id); }
+function esc(s){
+  return (s ?? "").toString().replace(/[&<>"']/g, m => (
+    {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]
+  ));
+}
+
+function setStatus(msg){
+  const el = $("status");
+  if (el) el.innerHTML = msg;
+}
+
+function pill(kind, text){
+  return `<span class="pill ${kind}">${esc(text)}</span>`;
+}
+
+function toast(msg, kind="info"){
+  const host = $("toastHost");
+  if(!host) return;
+  const el = document.createElement("div");
+  el.className = "toast";
+  el.innerHTML = `<div class="pill ${kind}">${esc(kind.toUpperCase())}</div><div class="msg">${esc(msg)}</div>`;
+  host.appendChild(el);
+  requestAnimationFrame(() => el.classList.add("show"));
+  setTimeout(() => {
+    el.classList.remove("show");
+    setTimeout(() => el.remove(), 200);
+  }, 2600);
+}
+
+function showModal(show){
+  const m = $("reviewModal");
+  if(!m) return;
+  if(show) m.classList.add("show");
+  else m.classList.remove("show");
+}
+
+
+
+function setReviewBusy(on, text="Working…"){
+  const ov = $("reviewBusy");
+  const tx = $("reviewBusyText");
+  if(!ov) return;
+  ov.style.display = on ? "block" : "none";
+  if(tx) tx.textContent = text;
+}
+
+function getApiKey(){
+  return (sessionStorage.getItem("torrentApiKey") || "").trim();
+}
+function setApiKey(v){
+  sessionStorage.setItem("torrentApiKey", (v || "").trim());
+}
+
+async function apiFetch(url, opts={}){
+  const headers = new Headers(opts.headers || {});
+  const key = getApiKey();
+  if (key) headers.set("X-API-Key", key);
+  return fetch(url, { ...opts, headers });
+}
+
+function fmtRate(kib){
+  const n = Number(kib);
+  if(!Number.isFinite(n) || n <= 0) return "";
+  if(n >= 1024) return `${(n/1024).toFixed(1)} MiB/s`;
+  return `${Math.round(n)} KiB/s`;
+}
+
+function row(item, site){
+  const title = item.name || item.title || "(untitled)";
+  const size  = item.size || "";
+  const seeds = item.seeders ?? item.seeds ?? "";
+  const leech = item.leechers ?? item.leeches ?? "";
+  const cat   = item.category || "";
+  const date  = item.date || "";
+  const magnet = item.magnet || "";
+  const torrent = item.torrent || "";
+
+  const links = [
+    item.url ? `<a href="${esc(item.url)}" target="_blank" rel="noreferrer">View</a>` : "",
+    torrent ? `<a href="${esc(torrent)}" target="_blank" rel="noreferrer">.torrent</a>` : "",
+    magnet ? `<a href="${esc(magnet)}" target="_blank" rel="noreferrer">Magnet</a>` : ""
+  ].filter(Boolean).join(" • ");
+
+  const canDownload = (magnet && magnet.startsWith("magnet:?")) || !!torrent;
+  const dlDisabled = canDownload ? "" : "disabled";
+
+  return `
+    <div class="track"
+      data-site="${esc(site)}"
+      data-title="${esc(title)}"
+      data-magnet="${esc(magnet)}"
+      data-torrent="${esc(torrent)}">
+      <div class="meta">
+        <p class="t">${esc(title)}</p>
+        <p class="a">${esc(cat)}${date ? " • " + esc(date) : ""}</p>
+        <div class="mini">${esc(size)}${links ? " • " + links : ""}</div>
+      </div>
+
+      <div class="rightActions">
+        <span class="pill ok">S ${esc(seeds)}</span>
+        <span class="pill warn">L ${esc(leech)}</span>
+        <button class="btn sm primary dlBtn" ${dlDisabled}>Download</button>
+      </div>
+    </div>
+  `;
+}
+
+async function loadSites(){
+  try{
+    const res = await apiFetch(`${API}/api/v1/sites`);
+    const data = await res.json();
+    const sel = $("site");
+    sel.innerHTML = "";
+    (data.supported_sites || []).forEach(s => {
+      const o = document.createElement("option");
+      o.value = s;
+      o.textContent = SITE_LABELS[s] || s;
+      sel.appendChild(o);
+    });
+
+    const preferred = "piratebay";
+    if ([...sel.options].some(o => o.value === preferred)) sel.value = preferred;
+
+    setStatus(sel.options.length ? pill("ok","Ready") : pill("warn","No supported sites returned"));
+  }catch(e){
+    setStatus(pill("bad", "Failed to load sites"));
+  }
+}
+
+async function doSearch(){
+  const site = $("site")?.value || "piratebay";
+  const q = ($("q")?.value || "").trim();
+  const limit = $("limit")?.value || "10";
+
+  if(!q){
+    setStatus(pill("warn", "Enter a search query"));
+    return;
+  }
+
+  setStatus(pill("info", "Searching…"));
+  const results = $("results");
+  if (results) results.innerHTML = "";
+
+  const url = `${API}/api/v1/search?site=${encodeURIComponent(site)}&query=${encodeURIComponent(q)}&limit=${encodeURIComponent(limit)}`;
+
+  try{
+    const res = await apiFetch(url);
+    const data = await res.json().catch(() => ({}));
+
+    if(!res.ok){
+      setStatus(pill("bad", data?.error || data?.detail || `HTTP ${res.status}`));
+      return;
+    }
+
+    const items = data?.data || [];
+    if(items.length === 0){
+      setStatus(pill("warn", "No results"));
+      return;
+    }
+
+    if (results) results.innerHTML = items.map(it => row(it, site)).join("");
+    setStatus(pill("ok", `Found ${items.length} result(s)`));
+  }catch(e){
+    setStatus(pill("bad", "Request failed"));
+  }
+}
+
+async function triggerDownload(trackEl, btn){
+  const site = trackEl.getAttribute("data-site") || "piratebay";
+  const title = trackEl.getAttribute("data-title") || "(untitled)";
+  const magnet = trackEl.getAttribute("data-magnet") || "";
+  const torrent = trackEl.getAttribute("data-torrent") || "";
+
+  const hasMagnet = magnet.startsWith("magnet:?");
+  const hasTorrent = !!torrent;
+
+  if(!hasMagnet && !hasTorrent){
+    btn.disabled = true;
+    btn.textContent = "N/A";
+    return;
+  }
+
+  btn.disabled = true;
+  btn.textContent = "Queuing…";
+
+  toast("Queuing download…", "info");
+
+  try{
+    const res = await apiFetch(`${API}/api/v1/download`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ site, title, magnet: hasMagnet ? magnet : "", torrent: hasTorrent ? torrent : "" }),
+    });
+
+    const data = await res.json().catch(() => ({}));
+
+    if(!res.ok || !data?.success){
+      const msg = data?.message || data?.detail || data?.error || `HTTP ${res.status}`;
+      btn.disabled = false;
+      btn.textContent = "Download";
+      toast(msg, "bad");
+      setStatus(pill("bad", msg));
+      return;
+    }
+
+    btn.textContent = "Queued";
+    toast(data?.deduped ? "Already queued (deduped)" : "Queued", data?.deduped ? "warn" : "ok");
+  }catch(e){
+    btn.disabled = false;
+    btn.textContent = "Download";
+    setStatus(pill("bad", "Download request failed"));
+  }
+}
+
+function wireDownloadButtons(){
+  const results = $("results");
+  if(!results) return;
+
+  results.addEventListener("click", (e) => {
+    const btn = e.target?.closest?.(".dlBtn");
+    if(!btn) return;
+
+    const trackEl = btn.closest(".track");
+    if(!trackEl) return;
+
+    triggerDownload(trackEl, btn);
+  });
+}
+
+/* -----------------------
+   Queue panel (polling)
+------------------------*/
+function statusPillFor(st){
+  if(st === "imported") return pill("ok", "imported");
+  if(st === "processing") return pill("info", "processing");
+  if(st === "ready") return pill("warn", "ready");
+  if(st === "completed") return pill("ok", "completed");
+  if(st === "downloading") return pill("info", "downloading");
+  if(st === "failed") return pill("bad", "failed");
+  if(st === "cancelled") return pill("warn", "cancelled");
+  return pill("warn", "queued");
+}
+
+function renderQueue(items){
+  const host = $("queue");
+  const qs = $("queueStatus");
+  if(!host) return;
+
+  if(!Array.isArray(items) || items.length === 0){
+    host.innerHTML = `<div class="mini" style="color:var(--muted);">No downloads yet.</div>`;
+    if (qs) qs.textContent = "";
+    return;
+  }
+
+  if (qs) qs.textContent = `Showing ${items.length} item(s)`;
+
+  host.innerHTML = items.map(it => {
+    const title = it.title || "(untitled)";
+    const st = it.status || "queued";
+    const prog = Number.isFinite(it.progress) ? Math.max(0, Math.min(100, it.progress)) : 0;
+    const err = it.error ? `<div class="mini" style="color: var(--red);">Error: ${esc(it.error)}</div>` : "";
+
+    const state = it.transmission_state ? ` • ${esc(it.transmission_state)}` : "";
+    const dl = it.rate_download_kib ? fmtRate(it.rate_download_kib) : "";
+    const ul = it.rate_upload_kib ? fmtRate(it.rate_upload_kib) : "";
+    const eta = it.eta ? esc(it.eta) : "";
+    const speedLine = (dl || ul || eta || state)
+      ? `<div class="mini" style="color:var(--muted);">${dl ? `DL ${esc(dl)}` : ""}${ul ? ` • UL ${esc(ul)}` : ""}${eta ? ` • ETA ${eta}` : ""}${state}</div>`
+      : "";
+
+    const canCancel = (st === "queued" || st === "downloading");
+    const cancelBtn = canCancel ? `<button class="btn sm cancelBtn" data-id="${esc(it.id)}">Cancel</button>` : "";
+
+    // Backend allows prepare/process when status is "ready" OR "completed"
+    const canReview = (st === "ready" || st === "completed");
+    const reviewBtn = canReview ? `<button class="btn sm primary reviewBtn" data-id="${esc(it.id)}">Review</button>` : "";
+
+    return `
+      <div class="queueItem">
+        <div class="queueTop">
+          <div class="queueTitle">${esc(title)}</div>
+          <div class="queueMeta">${statusPillFor(st)} ${reviewBtn} ${cancelBtn}</div>
+        </div>
+        ${speedLine}
+        ${["downloading","completed","ready","processing","imported"].includes(st) ? `
+          <div class="progressBar"><div style="width:${prog}%;"></div></div>
+          <div class="mini">${esc(prog)}%</div>
+        ` : ``}
+        ${err}
+      </div>
+    `;
+  }).join("");
+}
+
+function renderServicesHealth(payload){
+  const host = $("servicesBox");
+  if(!host) return;
+
+  const s = payload?.services || {};
+  const one = (name, obj) => {
+    const ok = !!obj?.ok;
+    const code = obj?.status;
+    const err = obj?.error;
+    const right = ok ? pill("ok", code ? `OK ${code}` : "OK") : pill("bad", err || (code ? `HTTP ${code}` : "down"));
+    return `<div style="display:flex;justify-content:space-between;gap:10px;margin:6px 0;">
+      <span>${esc(name)}</span>
+      <span>${right}</span>
+    </div>`;
+  };
+
+  host.innerHTML =
+    one("Transmission", s.transmission) +
+    one("AudiobookBay", s.audiobookbay) +
+    one("Jellyfin", s.jellyfin) +
+    one("Navidrome", s.navidrome);
+}
+
+async function pollServices(){
+  try{
+    const res = await apiFetch(`${API}/api/services/health`);
+    const data = await res.json().catch(() => ({}));
+    if(res.ok) renderServicesHealth(data);
+  }catch(e){
+    const host = $("servicesBox");
+    if(host) host.innerHTML = `<span class="pill bad">DOWN</span> <span style="margin-left:8px;">Services probe failed</span>`;
+  }
+}
+
+let currentReviewId = null;
+let reviewData = null;
+// Map relPath -> { rel, size, action }
+let fileActions = new Map();
+
+function rebuildFilesUI(){
+  const keepHost = $("filesKeep");
+  const delHost = $("filesDelete");
+  if(!keepHost || !delHost) return;
+
+  const keep = [];
+  const del = [];
+  for(const v of fileActions.values()){
+    if(v.action === "keep") keep.push(v);
+    else del.push(v);
+  }
+
+  const rowHtml = (f) => {
+    const size = Number.isFinite(f.size) ? `${(f.size/1024/1024).toFixed(2)} MB` : "";
+    const shownName = f.newName ? `→ ${f.newName}` : "";
+    const renameBtn = (f.action === "keep")
+      ? `<button type="button" class="btn sm renameBtn" data-rel="${esc(f.rel)}">Rename</button>`
+      : "";
+
+    return `
+      <div class="fileRow">
+        <input type="checkbox" data-rel="${esc(f.rel)}" ${f.action === "keep" ? "checked" : ""} />
+        <div class="fn mono" title="${esc(f.rel)}">
+          ${esc(f.rel)}
+          ${shownName ? `<div class="mini" style="color:var(--muted); margin-top:4px;">${esc(shownName)}</div>` : ""}
+        </div>
+        <div class="fs">${esc(size)}</div>
+        ${renameBtn}
+      </div>
+    `;
+  };
+
+  keepHost.innerHTML = keep.map(rowHtml).join("") || `<div class="mini" style="color:var(--muted);">None</div>`;
+  delHost.innerHTML  = del.map(rowHtml).join("")  || `<div class="mini" style="color:var(--muted);">None</div>`;
+}
+
+function computeDestPreview(){
+  if(!reviewData) return "";
+
+  const destType = ($("destType")?.value || "movies").toLowerCase();
+  const title = ($("titleInput")?.value || "").trim();
+  const year = ($("yearInput")?.value || "").trim();
+  const season = parseInt(($("seasonInput")?.value || "1"), 10);
+
+  const customRow = $("customDestRow");
+  if(customRow) customRow.style.display = (destType === "other") ? "block" : "none";
+
+  const seasonCol = $("seasonCol");
+  const yearCol = $("yearCol");
+
+  const isTV = (destType === "tv");
+  if(seasonCol) seasonCol.style.display = isTV ? "block" : "none";
+  // Year should be visible for Movies AND TV (optional)
+  if(yearCol) yearCol.style.display = (destType === "other" || destType === "music") ? "none" : "block";
+
+  if(destType === "movies"){
+    const y = year ? ` (${year.slice(0,4)})` : "";
+    return `/mnt/media/Movies/${title || "Untitled"}${y}`;
+  }
+  if(destType === "tv"){
+    const s = Number.isFinite(season) && season > 0 ? season : 1;
+    const y = year ? ` (${year.slice(0,4)})` : "";
+    return `/mnt/media/TV/${(title || "Untitled Show")}${y}/Season ${String(s).padStart(2,"0")}`;
+  }
+  if(destType === "music"){
+    return `/mnt/media/Music/_incoming`;
+  }
+
+  const sub = ($("customSubfolder")?.value || "").trim().replace(/^\/+/, "");
+  return `/mnt/media/${sub || "Other"}`;
+}
+
+function updateMusicMetaVisibility(){
+  const destType = (($("destType")?.value || "movies") + "").trim().toLowerCase();
+  const box = $("musicMetaBox");
+  if(!box) return;
+
+  if(destType !== "music"){
+    box.style.display = "none";
+    return;
+  }
+  box.style.display = "block";
+
+  const kind = ($("musicKind")?.value || "music").toLowerCase();
+  const mf = $("musicFields");
+  const af = $("audiobookFields");
+  if(mf) mf.style.display = (kind === "music") ? "block" : "none";
+  if(af) af.style.display = (kind === "audiobook") ? "block" : "none";
+}
+
+function applySuggestedToInputs(){
+  const suggested = (reviewData && reviewData.suggested) ? reviewData.suggested : {};
+  const destType = ($("destType")?.value || "movies").toLowerCase();
+
+  if(destType === "tv"){
+    $("titleInput").value = (suggested.show || suggested.title || reviewData.title || "Untitled Show").toString();
+    $("seasonInput").value = String(Number(suggested.season || 1) || 1);
+  }else if(destType === "movies"){
+    $("titleInput").value = (suggested.title || reviewData.title || "Untitled").toString();
+    $("yearInput").value = (suggested.year || "").toString();
+  }else{
+    $("titleInput").value = (reviewData.title || "Untitled").toString();
+    $("yearInput").value = "";
+  }
+
+  $("reviewDest").textContent = computeDestPreview();
+}
+
+function updateDestPreview(){
+  const p = computeDestPreview();
+  if($("reviewDest")) $("reviewDest").textContent = p;
+}
+
+function updateOptionsVisibility(){
+  const destType = (($("destType")?.value || "movies") + "").trim().toLowerCase();
+
+  const tvRow = $("tvAutoSplitRow");
+  const musicRow = $("musicRunBeetsRow");
+  const musicHint = $("musicLayoutHint");
+
+  // hard reset first (prevents “stuck visible”)
+  if(tvRow) tvRow.style.display = "none";
+  if(musicRow) musicRow.style.display = "none";
+  if(musicHint) musicHint.style.display = "none";
+
+  if(destType === "tv"){
+    if(tvRow) tvRow.style.display = "flex";
+  } else if(destType === "music"){
+    if(musicRow) musicRow.style.display = "flex";
+    if(musicHint) musicHint.style.display = "block";
+  }
+}
+
+async function openReview(id){
+  try{
+    toast("Preparing review…", "info");
+    setReviewBusy(true, "Preparing file list and TMDb matches…");
+    const res = await apiFetch(`${API}/api/v1/prepare/${encodeURIComponent(id)}`);
+    const data = await res.json().catch(()=>({}));
+    if(!res.ok || !data?.success){
+      toast(data?.detail || `Prepare failed (HTTP ${res.status})`, "bad");
+      return;
+    }
+
+    currentReviewId = id;
+    reviewData = data;
+
+    // Set UI defaults from server
+    try{
+      const ui = data.ui_settings || {};
+      if(ui.music_kind_guess && $("musicKind")){
+        $("musicKind").value = ui.music_kind_guess;
+      }
+      if (typeof ui.tv_auto_split_default !== "undefined") {
+        $("tvAutoSplit").checked = !!ui.tv_auto_split_default;
+      } else {
+        $("tvAutoSplit").checked = true;
+      }
+      if (typeof ui.music_recommend_beets !== "undefined") {
+        $("musicRunBeets").checked = !!ui.music_recommend_beets;
+      } else {
+        $("musicRunBeets").checked = true;
+      }
+    }catch(e){
+      // ignore
+    }
+
+    $("reviewSub").textContent = `${(data.transmission_state || data.category || "").toUpperCase()} • ${data.title || ""}`;
+
+    // Default dest type based on server guess
+    const guess = (data.category || "movies").toLowerCase();
+    const destTypeEl = $("destType");
+    if(destTypeEl){
+      if(["movies","tv","music"].includes(guess)) destTypeEl.value = guess;
+      else destTypeEl.value = "movies";
+    }
+
+    updateOptionsVisibility();
+    updateMusicMetaVisibility();
+
+    // Candidates
+    const sel = $("matchSelect");
+    const tmdbHint = $("tmdbHint");
+    if(sel){
+      sel.innerHTML = "";
+      const candidates = Array.isArray(data.candidates) ? data.candidates : [];
+      const suggested = data.suggested || {};
+      const opts = [];
+
+      if (suggested && (suggested.tmdb_id || suggested.title || suggested.show)) {
+        opts.push({ value: "suggested", label: `Suggested: ${suggested.label || suggested.title || suggested.show || "match"}`, meta: suggested });
+      }
+      candidates.forEach((c, idx) => {
+        opts.push({ value: `c${idx}`, label: c.label || c.title || c.show || `Match ${idx+1}`, meta: c });
+      });
+
+      if(opts.length === 0){
+        const o = document.createElement("option");
+        o.value = "none";
+        o.textContent = "No TMDb match found (using title fallback)";
+        sel.appendChild(o);
+        if(tmdbHint) tmdbHint.textContent = data.tmdb_debug ? `TMDb: ${data.tmdb_debug}` : "TMDb returned no matches.";
+      }else{
+        opts.forEach(o2 => {
+          const o = document.createElement("option");
+          o.value = o2.value;
+          o.textContent = o2.label;
+          o.dataset.meta = JSON.stringify(o2.meta || {});
+          sel.appendChild(o);
+        });
+        if(tmdbHint) tmdbHint.textContent = data.tmdb_debug ? `TMDb: ${data.tmdb_debug}` : "";
+      }
+    }
+
+    // Files list
+    fileActions = new Map();
+    const files = Array.isArray(data.files) ? data.files : [];
+    for(const f of files){
+      const rel = (f.rel || "").toString();
+      if(!rel) continue;
+      fileActions.set(rel, {
+        rel,
+        size: Number(f.size || 0),
+        action: (f.default_action === "keep") ? "keep" : "delete",
+        newName: ""
+      });
+    }
+    rebuildFilesUI();
+
+    // Inputs + preview
+    applySuggestedToInputs();
+    updateDestPreview();
+
+    showModal(true);
+
+    setReviewBusy(false);
+    toast("Review ready", "ok");
+  }catch(e){
+    toast("Prepare failed", "bad");
+    setReviewBusy(false);
+  }
+}
+
+async function approveMove(){
+  if(!currentReviewId || !reviewData) return;
+
+  try{
+    toast("Processing…", "info");
+    setReviewBusy(true, "Moving files into library…");
+
+    // TMDb selection meta + UI options (IMPORTANT: do not overwrite)
+    let meta = {};
+    const sel = $("matchSelect");
+    if(sel && sel.selectedOptions && sel.selectedOptions[0]){
+      try{ meta = JSON.parse(sel.selectedOptions[0].dataset.meta || "{}"); }catch(e){ meta = {}; }
+    }
+
+    // backend expects meta.options.*
+    meta.options = meta.options || {};
+    meta.options.tv_auto_split = !!($("tvAutoSplit")?.checked);
+    meta.options.music_run_beets = !!($("musicRunBeets")?.checked);
+
+    const destType = ($("destType")?.value || "movies").toLowerCase();
+    const title = ($("titleInput")?.value || "").trim();
+    const year  = ($("yearInput")?.value || "").trim();
+    const season = parseInt(($("seasonInput")?.value || "1"), 10);
+    const customSubfolder = ($("customSubfolder")?.value || "").trim();
+
+    // Build file decisions
+    const keep = [];
+    const del = [];
+    for(const v of fileActions.values()){
+      if(v.action === "keep") keep.push(v.rel);
+      else del.push(v.rel);
+    }
+
+    if(destType === "music"){
+      const kind = ($("musicKind")?.value || "music").toLowerCase();
+      meta.music = meta.music || {};
+      meta.music.kind = kind;
+
+      if(kind === "audiobook"){
+        meta.music.author = ($("abAuthor")?.value || "").trim();
+        meta.music.book   = ($("abBook")?.value || "").trim();
+        meta.music.year   = ($("abYear")?.value || "").trim();
+      }else{
+        meta.music.artist = ($("musicArtist")?.value || "").trim();
+        meta.music.album  = ($("musicAlbum")?.value || "").trim();
+        meta.music.year   = ($("musicYear")?.value || "").trim();
+      }
+    }
+
+    const overrides = {};
+    for(const v of fileActions.values()){
+      if(v.action === "keep" && v.newName && v.newName.trim()){
+        overrides[v.rel] = v.newName.trim();
+      }
+    }
+
+    const payload = {
+      id: currentReviewId,
+      dest_type: destType,
+      custom_subfolder: customSubfolder,
+      meta,
+      name_override: {
+        title,
+        year,
+        season: Number.isFinite(season) ? season : 1
+      },
+      keep_files: keep,
+      delete_files: del,
+      file_name_overrides: overrides,
+    };
+
+    const res = await apiFetch(`${API}/api/v1/process`, {
+      method: "POST",
+      headers: {"Content-Type":"application/json"},
+      body: JSON.stringify(payload)
+    });
+
+    const data = await res.json().catch(()=>({}));
+    if(!res.ok || !data?.success){
+      toast(data?.detail || data?.message || `Move failed (HTTP ${res.status})`, "bad");
+      setReviewBusy(false);
+      return;
+    }
+
+    const nd = data?.navidrome_scan;
+    if(destType === "music"){
+    toast(nd ? "Imported + Navidrome scan triggered" : "Imported (Navidrome scan not triggered)", nd ? "ok" : "warn");
+    }else{
+    toast("Imported + Jellyfin refresh triggered", "ok");
+    }
+
+    if(data.tv_summary && data.tv_summary.seasons){
+      const lines = [];
+      lines.push("Moved:");
+      lines.push(data.tv_summary.show_base.replace("/mnt/media/", "") + "/");
+      data.tv_summary.seasons.forEach(s => {
+        lines.push(`  Season ${String(s.season).padStart(2,"0")}/ (${s.files} files)`);
+      });
+      toast(lines.join(" "), "ok");
+    }else if(data.destination_dir){
+      toast(`Moved to: ${data.destination_dir}`, "ok");
+    }
+
+    showModal(false);
+    currentReviewId = null;
+    reviewData = null;
+    loadQueueOnce();
+  }catch(e){
+    toast("Move failed", "bad");
+    setReviewBusy(false);
+  }
+}
+
+async function loadQueueOnce(){
+  const key = getApiKey();
+  if(!key){
+    const host = $("queue");
+    if (host) host.innerHTML = `<div class="mini" style="color:var(--muted);">Set API key to view queue.</div>`;
+    return;
+  }
+
+  try{
+    const res = await apiFetch(`${API}/api/v1/queue`);
+    const data = await res.json().catch(() => ([]));
+    if(!res.ok){
+      const host = $("queue");
+      if (host) host.innerHTML = `<div class="mini" style="color:var(--muted);">Queue unavailable (HTTP ${res.status}).</div>`;
+      return;
+    }
+    renderQueue(data);
+  }catch(e){
+    const host = $("queue");
+    if (host) host.innerHTML = `<div class="mini" style="color:var(--muted);">Queue request failed.</div>`;
+  }
+}
+
+async function cancelDownloadById(id){
+  try{
+    const res = await apiFetch(`${API}/api/v1/cancel`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if(!res.ok || !data?.success){
+      const msg = data?.message || data?.detail || `HTTP ${res.status}`;
+      setStatus(pill("bad", msg));
+      return;
+    }
+    setStatus(pill("ok", "Cancelled"));
+    loadQueueOnce();
+  }catch(e){
+    setStatus(pill("bad", "Cancel failed"));
+  }
+}
+
+function startQueuePolling(){
+  loadQueueOnce();
+  setInterval(loadQueueOnce, 5000);
+}
+
+window.addEventListener("DOMContentLoaded", () => {
+  $("go")?.addEventListener("click", doSearch);
+  $("q")?.addEventListener("keydown", (e) => { if(e.key === "Enter") doSearch(); });
+
+  $("closeReview")?.addEventListener("click", () => showModal(false));
+  $("approveMove")?.addEventListener("click", approveMove);
+
+  $("reviewModal")?.addEventListener("click", (e) => {
+    if(e.target?.id === "reviewModal") showModal(false);
+  });
+
+  $("reviewModal")?.addEventListener("click", (e) => {
+    const btn = e.target?.closest?.(".renameBtn");
+    if(!btn) return;
+    const rel = btn.getAttribute("data-rel");
+    if(!rel || !fileActions.has(rel)) return;
+
+    const v = fileActions.get(rel);
+    const current = v.newName || "";
+    const suggested = prompt("Rename file (leave blank to clear). Include extension or it will be preserved:", current);
+    if(suggested === null) return;
+
+    v.newName = (suggested || "").trim();
+    fileActions.set(rel, v);
+    rebuildFilesUI();
+  });
+
+  $("queue")?.addEventListener("click", (e) => {
+    const r = e.target?.closest?.(".reviewBtn");
+    if(r){
+      const id = r.getAttribute("data-id");
+      if(id) openReview(id);
+      return;
+    }
+  });
+
+  $("queue")?.addEventListener("click", (e) => {
+    const btn = e.target?.closest?.(".cancelBtn");
+    if(!btn) return;
+    const id = btn.getAttribute("data-id");
+    if(!id) return;
+    cancelDownloadById(id);
+  });
+
+  // file checkbox toggles
+  const modal = $("reviewModal");
+  modal?.addEventListener("change", (e) => {
+    const cb = e.target?.closest?.("input[type='checkbox'][data-rel]");
+    if(!cb) return;
+    const rel = cb.getAttribute("data-rel");
+    if(!rel || !fileActions.has(rel)) return;
+
+    // If checked -> keep, unchecked -> delete
+    const v = fileActions.get(rel);
+    v.action = cb.checked ? "keep" : "delete";
+    fileActions.set(rel, v);
+    rebuildFilesUI();
+  });
+
+  // Destination + name editors update preview live
+  ["destType","customSubfolder","titleInput","yearInput","seasonInput"].forEach(id => {
+    $(id)?.addEventListener("input", updateDestPreview);
+    $(id)?.addEventListener("change", () => {
+      updateDestPreview();
+      // When destination type changes, re-apply suggested fields into appropriate inputs
+      if(id === "destType"){
+        applySuggestedToInputs();
+        updateOptionsVisibility();
+        updateMusicMetaVisibility();
+      } else {
+        updateOptionsVisibility();
+        updateMusicMetaVisibility();
+      }
+    });
+  });
+
+  // Match dropdown -> update suggested fields
+  $("matchSelect")?.addEventListener("change", () => {
+    if(!reviewData) return;
+    // replace reviewData.suggested with selected meta (so inputs follow)
+    const sel = $("matchSelect");
+    if(sel && sel.selectedOptions && sel.selectedOptions[0]){
+      try{
+        const meta = JSON.parse(sel.selectedOptions[0].dataset.meta || "{}");
+        if(meta && typeof meta === "object") reviewData.suggested = meta;
+      }catch(e){}
+    }
+    applySuggestedToInputs();
+    updateDestPreview();
+    updateOptionsVisibility();
+    updateMusicMetaVisibility();
+  });
+
+  $("musicKind")?.addEventListener("change", updateMusicMetaVisibility);
+
+  $("rescanBtn")?.addEventListener("click", async () => {
+    try{
+      toast("Rescanning libraries…", "info");
+      const res = await apiFetch(`${API}/api/v1/library/rescan`, { method: "POST" });
+      const data = await res.json().catch(()=>({}));
+      if(!res.ok || !data?.success){
+        toast(data?.detail || `Rescan failed (HTTP ${res.status})`, "bad");
+        return;
+      }
+      const jf = data.jellyfin_triggered ? "Jellyfin ✅" : "Jellyfin ⚠️";
+      const nd = data.navidrome_triggered ? "Navidrome ✅" : "Navidrome ⚠️";
+      const msg = `Rescan triggered: ${jf} • ${nd}`;
+      $("rescanHint").textContent = msg;
+      toast(msg, "ok");
+    }catch(e){
+      toast("Rescan failed", "bad");
+    }
+  });
+
+  // API key save
+  $("saveKey")?.addEventListener("click", (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    const v = ($("apiKey")?.value || "").trim();
+    setApiKey(v);
+    setStatus(v ? pill("ok","API key saved (session)") : pill("warn","API key cleared"));
+    toast(v ? "API key saved" : "API key cleared", v ? "ok" : "warn");
+    loadQueueOnce();
+  });
+
+  // Load key into input
+  const existing = getApiKey();
+  if ($("apiKey")) $("apiKey").value = existing;
+
+  wireDownloadButtons();
+  loadSites();
+  startQueuePolling();
+  pollServices();
+  setInterval(pollServices, 8000);
+});

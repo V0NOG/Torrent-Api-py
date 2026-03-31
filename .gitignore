@@ -1,9 +1,5 @@
-# created by virtualenv automatically
-__pycache__
-api-py
-.env
-function.*
-.vscode
-test.py
-*.log
-test.json
+.venv/
+api-py/
+__pycache__/
+*.pyc
+queue_state.json

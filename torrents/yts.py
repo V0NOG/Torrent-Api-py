@@ -6,6 +6,7 @@ from bs4 import BeautifulSoup
 from helper.asyncioPoliciesFix import decorator_asyncio_fix
 from helper.html_scraper import Scraper
 from constants.base_url import YTS
+from helper.proxy_helper import get_aiohttp_connector
 from constants.headers import HEADER_AIO
 
 
@@ -127,7 +128,8 @@ class Yts:
             return None, None
 
     async def search(self, query, page, limit):
-        async with aiohttp.ClientSession() as session:
+        connector = get_aiohttp_connector(self.BASE_URL)
+        async with aiohttp.ClientSession(connector=connector) as session:
             start_time = time.time()
             self.LIMIT = limit
             if page != 1:
@@ -154,14 +156,16 @@ class Yts:
         return result
 
     async def trending(self, category, page, limit):
-        async with aiohttp.ClientSession() as session:
+        connector = get_aiohttp_connector(self.BASE_URL)
+        async with aiohttp.ClientSession(connector=connector) as session:
             start_time = time.time()
             self.LIMIT = limit
             url = self.BASE_URL + "/trending-movies"
             return await self.parser_result(start_time, url, session)
 
     async def recent(self, category, page, limit):
-        async with aiohttp.ClientSession() as session:
+        connector = get_aiohttp_connector(self.BASE_URL)
+        async with aiohttp.ClientSession(connector=connector) as session:
             start_time = time.time()
             self.LIMIT = limit
             if page != 1:
