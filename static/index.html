@@ -1,0 +1,788 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="PiMedia" />
+  <meta name="theme-color" content="#0d0d1a" />
+  <title>PiMedia</title>
+  <link rel="icon" type="image/svg+xml" href="/static/favicon.svg" />
+  <link rel="apple-touch-icon" href="/static/icon-192.svg" />
+  <link rel="stylesheet" href="/app.css" />
+</head>
+<body>
+
+  <!-- LOGIN SCREEN (shown when not authenticated) -->
+  <div id="loginScreen" class="loginScreen" style="display:none;">
+    <div class="loginBox">
+      <div class="brand" style="margin-bottom:24px;">
+        <div class="logo"></div>
+        <div>
+          <h1>Homelab</h1>
+          <div class="sub">Sign in to continue</div>
+        </div>
+      </div>
+
+      <div class="field">
+        <label class="mini">Username</label>
+        <input id="loginUser" type="text" placeholder="jellyfin username" autocomplete="username" />
+      </div>
+      <div class="field">
+        <label class="mini">Password</label>
+        <input id="loginPass" type="password" placeholder="password" autocomplete="current-password" />
+      </div>
+      <div id="loginError" class="mini" style="color:var(--red); min-height:18px; margin-bottom:4px;"></div>
+      <button id="loginBtn" class="btn primary" style="width:100%; padding:14px; font-size:16px; margin-top:4px;">Sign In</button>
+    </div>
+  </div>
+
+  <!-- MAIN APP (shown when authenticated) -->
+  <div id="appShell" style="display:none;">
+
+    <div class="topbar">
+      <div class="wrap">
+        <div class="brand">
+          <div class="logo"></div>
+          <div>
+            <h1>Homelab</h1>
+            <div class="sub brandSub">Media &bull; Music &bull; Downloads</div>
+          </div>
+        </div>
+        <div class="actions">
+          <button id="torrentTabBtn" class="btn">Torrent</button>
+          <button id="musicTabBtn" class="btn">Music</button>
+          <button id="queueTabBtn" class="btn">Queue <span id="queueBadge" class="queueBadge" style="display:none;"></span></button>
+          <button id="filesTabBtn" class="btn" style="display:none;">Files</button>
+          <button id="sitesTabBtn" class="btn" style="display:none;">Sites</button>
+          <button id="settingsTabBtn" class="btn" style="display:none;">Settings</button>
+          <button id="themeBtn" class="btn" title="Toggle light/dark mode" aria-label="Toggle theme" style="padding:8px 10px;"></button>
+          <div class="userDropdown" id="userDropdown">
+            <button class="btn userDropdownTrigger" id="userDropdownBtn" style="touch-action:manipulation;cursor:pointer;" ontouchend="event.preventDefault();event.stopPropagation();window.showTab('settings');">
+              <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="8" r="4"/><path d="M4 20c0-4 3.6-7 8-7s8 3 8 7"/></svg>
+              <span id="userDisplayName"></span>
+              <svg width="11" height="11" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24" aria-hidden="true"><polyline points="6 9 12 15 18 9"/></svg>
+            </button>
+            <div class="userDropdownMenu" id="userDropdownMenu">
+              <button class="userDropdownItem" id="settingsMenuBtn" ontouchend="event.preventDefault();event.stopPropagation();document.getElementById('userDropdownMenu').classList.remove('open');window.showTab('settings');">
+                <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 010 2.83 2 2 0 01-2.83 0l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-4 0v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 01-2.83-2.83l.06-.06A1.65 1.65 0 004.68 15a1.65 1.65 0 00-1.51-1H3a2 2 0 010-4h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 012.83-2.83l.06.06A1.65 1.65 0 009 4.68a1.65 1.65 0 001-1.51V3a2 2 0 014 0v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 012.83 2.83l-.06.06A1.65 1.65 0 0019.4 9a1.65 1.65 0 001.51 1H21a2 2 0 010 4h-.09a1.65 1.65 0 00-1.51 1z"/></svg>
+                Settings
+              </button>
+              <button class="userDropdownItem" id="logoutBtn" ontouchend="event.preventDefault();event.stopPropagation();document.getElementById('userDropdownMenu').classList.remove('open');window.doLogout();">Sign Out</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- TORRENT TAB -->
+    <div id="torrentTab" class="wrap">
+      <div class="stack">
+        <div class="card primary-card">
+          <h2 class="title">Torrent Search</h2>
+          <p class="hint">Search torrents and queue magnets into Transmission. Review becomes available only when download is truly finished.</p>
+
+          <div id="ndCredsField" class="field" style="display:none;">
+            <label class="mini">Navidrome Account <span class="mini" style="color:var(--muted); font-weight:400;">(for audiobook playlists)</span></label>
+            <div class="row" style="gap:8px; flex-wrap:wrap;">
+              <input id="ndUser" placeholder="Navidrome username" autocomplete="username" style="flex:1; min-width:120px;" />
+              <input id="ndPass" type="password" placeholder="Navidrome password" autocomplete="current-password" style="flex:1; min-width:120px;" />
+              <button id="saveNd" type="button" class="btn primary">Save</button>
+            </div>
+            <div id="ndSaveHint" class="mini" style="color:var(--muted); min-height:16px; margin-top:4px;"></div>
+          </div>
+
+          <div class="field">
+            <label class="mini">Site</label>
+            <div class="row">
+              <select id="site" class="btn" style="flex:1;"></select>
+              <select id="limit" class="btn" style="width:120px;">
+                <option>5</option>
+                <option selected>10</option>
+                <option>20</option>
+                <option>50</option>
+                <option>100</option>
+              </select>
+            </div>
+            <div class="mini" style="margin-top:8px;color:var(--muted);">
+              Destination type is chosen during <b>Review</b> (Movies / TV / Music / Other).
+            </div>
+          </div>
+
+          <div class="field" id="searchFiltersField">
+            <label class="mini">Filters</label>
+            <div style="display:flex; flex-direction:column; gap:8px; align-items:flex-start;">
+              <div class="segControl" id="filterQualityControl">
+                <button class="segBtn active" data-fq="any">Any</button>
+                <button class="segBtn" data-fq="720p">720p</button>
+                <button class="segBtn" data-fq="1080p">1080p</button>
+                <button class="segBtn" data-fq="4k">4K</button>
+              </div>
+              <div class="segControl" id="filterCategoryControl">
+                <button class="segBtn active" data-fc="any">Any</button>
+                <button class="segBtn" data-fc="movies">Movies</button>
+                <button class="segBtn" data-fc="tv">TV</button>
+                <button class="segBtn" data-fc="music">Music</button>
+                <button class="segBtn" data-fc="books">Books</button>
+              </div>
+            </div>
+          </div>
+
+          <div class="field">
+            <label class="mini">Search</label>
+            <input id="q" placeholder="e.g., The Dark Knight 2008" />
+          </div>
+
+          <div class="searchButtonRow">
+            <button id="go" class="btn primary">Search</button>
+          </div>
+
+          <div style="margin-top:12px;" id="status"></div>
+          <div class="results" id="results"></div>
+        </div>
+
+        <div class="card" id="recentlyAddedCard">
+          <h2 class="title">Recently Added</h2>
+          <div id="recentlyAddedList" class="mini" style="color:var(--muted);">Loading…</div>
+        </div>
+
+      </div>
+    </div>
+
+    <!-- FILE MANAGER TAB -->
+    <div id="filesTab" class="wrap" style="display:none;">
+      <div class="card">
+        <div style="display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:14px; flex-wrap:wrap;">
+          <div>
+            <h2 class="title" style="margin:0;">File Manager</h2>
+            <div class="mini" style="color:var(--muted); margin-top:4px;" id="fmPathDisplay">Loading…</div>
+          </div>
+          <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
+            <button id="fmRefresh" class="btn sm">Refresh</button>
+            <button id="fmMkdir" class="btn sm">New Folder</button>
+            <div class="segControl" id="fmViewToggle" style="flex-shrink:0;">
+              <button class="segBtn active" id="fmViewList" title="List view" aria-label="List view">
+                <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24" aria-hidden="true"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><circle cx="3" cy="6" r="1" fill="currentColor"/><circle cx="3" cy="12" r="1" fill="currentColor"/><circle cx="3" cy="18" r="1" fill="currentColor"/></svg>
+              </button>
+              <button class="segBtn" id="fmViewGrid" title="Grid view" aria-label="Grid view">
+                <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <!-- Root selector (admin sees multiple roots) -->
+        <div id="fmRootRow" style="display:none; margin-bottom:10px;">
+          <label class="mini" style="color:var(--muted); display:block; margin-bottom:6px;">Root</label>
+          <select id="fmRootSelect" class="btn" style="width:100%;"></select>
+        </div>
+
+        <!-- Breadcrumb + filter row -->
+        <div style="display:flex; align-items:center; gap:10px; margin-bottom:8px; flex-wrap:wrap; min-width:0;">
+          <div id="fmBreadcrumb" class="fmBreadcrumb" style="flex:1 1 auto; min-width:0; margin-bottom:0;"></div>
+          <div id="fmSearchBar" class="fmFilterPill" style="display:none;">
+            <svg width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24" aria-hidden="true" class="fmFilterIcon"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+            <input id="fmFilterInput" placeholder="Filter files…" autocomplete="off" />
+            <span class="fmSearchCount" id="fmFilterCount"></span>
+          </div>
+        </div>
+
+        <!-- Sort + search filter row -->
+        <div id="fmFilterRow" style="display:flex; gap:8px; align-items:center; margin-bottom:12px; flex-wrap:wrap;">
+          <div class="segControl" id="fmSortGroup" style="flex:0 0 auto;">
+            <button class="segBtn active" data-sort="name">Name</button>
+            <button class="segBtn" data-sort="modified">Recent</button>
+            <button class="segBtn" data-sort="size">Size</button>
+          </div>
+          <button id="fmSortDirBtn" class="btn" style="flex:0 0 auto; padding:8px 10px;" title="Toggle sort direction">↑</button>
+          <input id="fmSearchInput" type="text" placeholder="Search files and folders…" style="flex:1; min-width:160px;" autocomplete="off" />
+          <button id="fmSelectModeBtn" class="btn sm" style="flex:0 0 auto;" title="Select items to delete">Select</button>
+        </div>
+
+        <!-- File listing -->
+        <div id="fmList" class="fmList">
+          <div class="mini" style="color:var(--muted);">Loading…</div>
+        </div>
+      </div>
+    </div>
+    <!-- Multi-select toolbar (fixed bottom, shown in selection mode) -->
+    <div id="fmSelectionToolbar" class="fmSelectionToolbar" style="display:none;">
+      <div class="fmSelectionToolbarInner">
+        <span id="fmSelectionCount" class="mini" style="font-weight:600; color:var(--text);">0 selected</span>
+        <button id="fmSelectAllBtn" class="btn sm">Select All</button>
+        <button id="fmSelectionDeleteBtn" class="btn sm" style="border-color:rgba(255,69,58,.5); background:rgba(255,69,58,.15); color:var(--red);" disabled>Delete Selected</button>
+        <button id="fmSelectionCancelBtn" class="btn sm">Cancel</button>
+      </div>
+    </div>
+
+  </div><!-- /appShell -->
+
+  <!-- MUSIC TAB -->
+  <div id="musicTab" class="wrap" style="display:none;">
+    <div class="musicPillNav">
+      <div class="segControl" id="musicNav">
+        <button class="segBtn active" data-ms="search">Music</button>
+        <button class="segBtn" data-ms="request">Request</button>
+        <button class="segBtn" data-ms="playlist">Playlist</button>
+        <button class="segBtn" data-ms="youtube">Video</button>
+      </div>
+    </div>
+
+    <!-- Search section -->
+    <div id="musicSectionSearch">
+      <div class="card primary-card" style="margin-top:14px;">
+        <h2 class="title">YouTube Search</h2>
+        <p class="hint">Search YouTube for music. Results are checked against your library — duplicates are flagged before you request.</p>
+        <div class="field">
+          <div class="row">
+            <input id="musicQ" placeholder="e.g., Daft Punk – Get Lucky" style="flex:1;" />
+            <select id="musicLimit" class="btn" style="width:90px;">
+              <option>5</option>
+              <option selected>10</option>
+              <option>20</option>
+            </select>
+          </div>
+        </div>
+        <div class="searchButtonRow">
+          <button id="musicSearchBtn" class="btn primary">Search YouTube</button>
+        </div>
+        <div style="margin-top:12px;" id="musicSearchStatus"></div>
+        <div class="results" id="musicResults"></div>
+      </div>
+    </div>
+
+    <!-- Request section -->
+    <div id="musicSectionRequest" style="display:none;">
+      <div class="card" style="margin-top:14px;">
+        <h2 class="title">Request by URL</h2>
+        <p class="hint">Paste a YouTube URL to download directly to your music library.</p>
+        <div class="field">
+          <label class="mini">YouTube URL</label>
+          <input id="musicUrl" type="url" placeholder="https://youtube.com/watch?v=…" />
+          <div id="musicUrlQueueWarning" style="display:none; margin-top:4px;"></div>
+        </div>
+        <div class="field">
+          <label class="mini">Custom title <span class="mini" style="font-weight:400;color:var(--muted);">(optional — overrides auto-detect)</span></label>
+          <input id="musicCustomTitle" placeholder="Artist – Song Title" />
+        </div>
+        <div id="musicUrlDupWarning" style="display:none; margin-bottom:8px;"></div>
+        <button id="musicRequestBtn" class="btn primary" style="width:100%;">Request Track</button>
+        <div id="musicRequestHint" class="mini" style="color:var(--muted); margin-top:8px; min-height:16px;"></div>
+      </div>
+    </div>
+
+    <!-- Playlist section -->
+    <div id="musicSectionPlaylist" style="display:none;">
+      <div class="card" style="margin-top:14px;">
+        <h2 class="title">CSV Playlist</h2>
+        <p class="hint">Upload a CSV (artist + title columns) to bulk-request tracks and create a Navidrome playlist on completion.</p>
+        <div class="field">
+          <label class="mini">Playlist name</label>
+          <input id="csvPlaylistName" value="My Playlist" />
+        </div>
+        <div class="field">
+          <label class="mini">CSV file</label>
+          <div class="csvDropZone" id="csvDropZone">
+            <svg class="csvDropIcon" width="32" height="32" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24" aria-hidden="true"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+            <div class="csvDropText">Drop CSV here or click to browse</div>
+            <div class="csvDropName" id="csvFileName"></div>
+            <input type="file" accept=".csv,text/csv" id="csvFileInput" />
+          </div>
+        </div>
+        <button id="csvUploadBtn" class="btn primary" style="width:100%;">Upload Playlist</button>
+        <div id="csvUploadHint" class="mini" style="color:var(--muted); margin-top:8px; min-height:16px;"></div>
+        <div id="csvSkippedReport" style="display:none; margin-top:12px;"></div>
+      </div>
+    </div>
+
+    <!-- YouTube → Jellyfin section -->
+    <div id="musicSectionYoutube" style="display:none;">
+      <div class="card" style="margin-top:14px;">
+        <h2 class="title">YouTube → Jellyfin</h2>
+        <p class="hint">Download a YouTube video as MP4 directly to your Jellyfin library.</p>
+        <div class="field">
+          <label class="mini">YouTube URL</label>
+          <input id="ytUrl" type="url" placeholder="https://youtube.com/watch?v=… or playlist URL" />
+          <div id="ytPlaylistPreview" style="display:none; margin-top:8px; padding:10px 12px; border-radius:10px; border:1px solid var(--line); background:var(--panel);">
+            <div class="mini" id="ytPlaylistInfo" style="color:var(--text); margin-bottom:8px;"></div>
+            <button id="ytPlaylistDownloadAll" class="btn primary" style="width:100%;">Download all to Jellyfin</button>
+          </div>
+        </div>
+        <div class="field">
+          <label class="mini">Subfolder <span class="mini" style="font-weight:400;color:var(--muted);">(optional — under /mnt/media/YouTube/)</span></label>
+          <div style="position:relative;">
+            <input id="ytSubfolder" type="text" placeholder="e.g. Concerts (or type a new folder name)" autocomplete="off" />
+            <div id="ytFolderDropdown" style="display:none; position:absolute; top:100%; left:0; right:0; z-index:200; background:var(--panel); border:1px solid var(--line); border-radius:10px; overflow:hidden; margin-top:4px; max-height:200px; overflow-y:auto;"></div>
+          </div>
+        </div>
+        <div class="field">
+          <label class="mini">Custom filename <span class="mini" style="font-weight:400;color:var(--muted);">(optional — overrides auto title)</span></label>
+          <input id="ytTitle" placeholder="Leave blank to use video title" />
+        </div>
+        <label class="optRow toggleRow" style="margin-bottom:10px;">
+          <span class="toggle">
+            <input id="ytRescan" type="checkbox" checked />
+            <span class="knob" aria-hidden="true"></span>
+          </span>
+          <span class="mini">Trigger Jellyfin rescan after download</span>
+        </label>
+        <button id="ytDownloadBtn" class="btn primary" style="width:100%;">Download to Jellyfin</button>
+        <div id="ytHint" class="mini" style="color:var(--muted); margin-top:8px; min-height:16px;"></div>
+        <div id="ytQueueList" class="results" style="margin-top:10px;"></div>
+      </div>
+    </div>
+
+    <!-- Music Recently Added card -->
+    <div class="card" id="musicRecentlyAddedCard" style="margin-top:14px;">
+      <h2 class="title">Recently Added</h2>
+      <div id="musicRecentlyAddedList" class="mini" style="color:var(--muted);">Loading…</div>
+    </div>
+  </div>
+
+  <!-- QUEUE TAB (outside appShell) -->
+  <div id="queueTab" class="wrap" style="display:none;">
+
+    <!-- Filter bar -->
+    <div id="queueFilterBar" class="queueFilterBar">
+      <div class="queueFilterControls">
+        <div class="segControl">
+          <button class="segBtn active" data-qf-type="all">All</button>
+          <button class="segBtn" data-qf-type="torrent">Torrent</button>
+          <button class="segBtn" data-qf-type="music">Music</button>
+        </div>
+        <div class="segControl">
+          <button class="segBtn active" data-qf-status="all">All</button>
+          <button class="segBtn" data-qf-status="active">Active</button>
+          <button class="segBtn" data-qf-status="done">Done</button>
+          <button class="segBtn" data-qf-status="failed">Failed</button>
+        </div>
+      </div>
+      <input id="queueFilterText" placeholder="Search…" class="queueFilterSearch" />
+    </div>
+
+    <div class="stack">
+      <!-- Now Playing Widget -->
+      <div class="card" id="nowPlayingWidget" style="display:none;">
+        <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:10px;">
+          <h2 class="title" style="margin:0;">Now Playing</h2>
+          <span class="mini" style="color:var(--muted);" id="nowPlayingCount"></span>
+        </div>
+        <div id="nowPlayingContent"></div>
+      </div>
+      <!-- Torrent Download Queue -->
+      <div class="card" id="queueTorrentCard">
+        <div style="display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:10px;">
+          <h2 class="title" style="margin:0;">Download Queue</h2>
+          <div id="queueStatus" class="mini" style="color:var(--muted);"></div>
+        </div>
+        <p class="hint">Live status from Transmission. Review is enabled only when download is complete.</p>
+        <div id="queue" class="queue"></div>
+      </div>
+      <!-- Music Queue -->
+      <div class="card" id="queueMusicCard">
+        <div style="display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:10px;">
+          <h2 class="title" style="margin:0;">Music Queue</h2>
+          <span id="musicWorkerBadge" class="mini" style="color:var(--muted);"></span>
+        </div>
+        <p class="hint">Music import worker — tracks queued via YouTube search or direct URL.</p>
+        <div id="musicQueueHost" class="queue"></div>
+      </div>
+      <!-- Video Queue -->
+      <div class="card" id="queueVideoCard">
+        <div style="display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:10px;">
+          <h2 class="title" style="margin:0;">Video Queue</h2>
+          <span id="videoQueueBadge" class="mini" style="color:var(--muted);"></span>
+        </div>
+        <p class="hint">YouTube → Jellyfin downloads.</p>
+        <div id="videoQueueHost" class="queue"></div>
+      </div>
+    </div>
+  </div>
+
+  <div id="toastHost" class="toastHost"></div>
+
+  <!-- Review/Move modal -->
+  <div id="reviewModal" class="modal" aria-hidden="true">
+    <div class="box" role="dialog" aria-modal="true" aria-labelledby="reviewModalTitle">
+
+      <div class="modalHeader">
+        <div style="min-width:0;flex:1;">
+          <div id="reviewModalTitle" class="title" style="margin:0;">Review &amp; Move</div>
+          <div id="reviewSub" class="mini" style="color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;"></div>
+        </div>
+        <button id="closeReview" class="btn sm" aria-label="Close review modal">Close</button>
+      </div>
+
+      <div class="reviewGrid" style="margin-top:12px;">
+        <div>
+          <div class="mini" style="color:var(--muted);margin-bottom:6px;">Destination type</div>
+          <div class="segControl" id="destTypeControl">
+            <button class="segBtn active" data-dest="movies" style="flex:1;justify-content:center;">Movies</button>
+            <button class="segBtn" data-dest="tv" style="flex:1;justify-content:center;">TV</button>
+            <button class="segBtn" data-dest="music" style="flex:1;justify-content:center;">Music</button>
+            <button class="segBtn" data-dest="other" style="flex:1;justify-content:center;">Other</button>
+          </div>
+          <input type="hidden" id="destType" value="movies" />
+
+          <div id="customDestRow" style="margin-top:10px; display:none;">
+            <div class="mini" style="color:var(--muted);margin-bottom:6px;">Custom subfolder (under /mnt/media)</div>
+            <input id="customSubfolder" placeholder="e.g., Other/Downloads" />
+            <div class="mini" style="margin-top:6px;color:var(--muted);">
+              This becomes: <span class="mono">/mnt/media/&lt;your path&gt;</span>
+            </div>
+          </div>
+
+          <div style="margin-top:12px;">
+            <div class="mini" style="color:var(--muted);margin-bottom:6px;">Options</div>
+            <div class="optStack">
+              <label id="tvAutoSplitRow" class="optRow toggleRow" style="display:none;">
+                <span class="toggle">
+                  <input id="tvAutoSplit" type="checkbox" checked />
+                  <span class="knob" aria-hidden="true"></span>
+                </span>
+                <span class="mini">Auto-split TV seasons into individual Season folders (recommended)</span>
+              </label>
+
+              <label id="musicRunBeetsRow" class="optRow toggleRow" style="display:none;">
+                <span class="toggle">
+                  <input id="musicRunBeets" type="checkbox" checked />
+                  <span class="knob" aria-hidden="true"></span>
+                </span>
+                <span class="mini">For Music: run beets import (recommended)</span>
+              </label>
+
+              <div id="musicLayoutHint" class="mini" style="display:none;color:var(--muted); margin-top:2px;">
+                Suggested layout: <span class="mono">Artist/Album/01 - Track Title.ext</span><br/>
+                If filename parsing fails, files go to <span class="mono">/mnt/media/Music/_incoming</span>
+              </div>
+
+              <div id="musicMetaBox" class="optRow" style="display:none; border-top:1px solid var(--line); margin-top:10px; padding-top:10px;">
+                <div class="mini" style="color:var(--muted);font-weight:600;margin-bottom:8px;">Music metadata</div>
+                <div class="field" style="margin:0;">
+                  <label class="mini">Mode</label>
+                  <div class="segControl" id="musicKindControl" style="width:100%;">
+                    <button class="segBtn active" data-mk="music" style="flex:1;justify-content:center;">Music</button>
+                    <button class="segBtn" data-mk="audiobook" style="flex:1;justify-content:center;">Audiobook</button>
+                  </div>
+                  <input type="hidden" id="musicKind" value="music" />
+                </div>
+                <div id="musicFields" style="margin-top:10px;">
+                  <div class="grid3">
+                    <div>
+                      <div class="mini" style="color:var(--muted);margin-bottom:6px;">Artist</div>
+                      <input id="musicArtist" placeholder="e.g., Daft Punk" />
+                    </div>
+                    <div>
+                      <div class="mini" style="color:var(--muted);margin-bottom:6px;">Album</div>
+                      <input id="musicAlbum" placeholder="e.g., Discovery" />
+                    </div>
+                    <div>
+                      <div class="mini" style="color:var(--muted);margin-bottom:6px;">Year (optional)</div>
+                      <input id="musicYear" placeholder="2001" inputmode="numeric" />
+                    </div>
+                  </div>
+                </div>
+                <div id="audiobookFields" style="margin-top:10px; display:none;">
+                  <div class="grid3">
+                    <div>
+                      <div class="mini" style="color:var(--muted);margin-bottom:6px;">Author</div>
+                      <input id="abAuthor" placeholder="e.g., Brandon Sanderson" />
+                    </div>
+                    <div>
+                      <div class="mini" style="color:var(--muted);margin-bottom:6px;">Book Name</div>
+                      <input id="abBook" placeholder="e.g., Mistborn" />
+                    </div>
+                    <div>
+                      <div class="mini" style="color:var(--muted);margin-bottom:6px;">Year (optional)</div>
+                      <input id="abYear" placeholder="2006" inputmode="numeric" />
+                    </div>
+                  </div>
+                </div>
+                <div id="musicPathHint" class="mini" style="margin-top:10px;color:var(--muted);">
+                  Music &rarr; <span class="mono">/mnt/media/Music/Artist/Album (Year)/</span>
+                </div>
+                <div id="audiobookPathHint" class="mini" style="display:none;margin-top:4px;color:var(--muted);">
+                  Audiobooks &rarr; <span class="mono">/mnt/media/Music/Audiobooks/Author/Book (Year)/</span>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="tmdbOnlyFields">
+          <div style="margin-top:12px;">
+            <div class="mini" style="color:var(--muted);margin-bottom:6px;">TMDb Match</div>
+            <div id="matchSelect" class="tmdbMatchList"></div>
+            <div class="mini" id="tmdbHint" style="margin-top:6px;color:var(--muted);"></div>
+          </div>
+          </div><!-- /.tmdbOnlyFields -->
+
+          <div id="metaDetectPanel" class="metaDetectPanel" style="display:none; margin-top:12px;"></div>
+
+          <div id="nameEditor" style="margin-top:12px;">
+            <div class="mini" style="color:var(--muted);margin-bottom:6px;">Folder name editor</div>
+            <div class="grid3">
+              <div>
+                <div class="mini" style="color:var(--muted);margin-bottom:6px;">Title / Show</div>
+                <input id="titleInput" placeholder="Title" />
+              </div>
+              <div id="yearCol">
+                <div class="mini" style="color:var(--muted);margin-bottom:6px;">Year (optional)</div>
+                <input id="yearInput" placeholder="2025" inputmode="numeric" />
+              </div>
+              <div id="seasonCol" style="display:none;">
+                <div class="mini" style="color:var(--muted);margin-bottom:6px;">Season</div>
+                <input id="seasonInput" type="number" min="1" value="1" />
+              </div>
+            </div>
+            <div style="margin-top:10px;">
+              <div class="mini" style="color:var(--muted);margin-bottom:6px;">Preview destination</div>
+              <div id="reviewDest" class="mono monoBox"></div>
+            </div>
+          </div>
+        </div>
+
+        <div>
+          <div class="mini" style="color:var(--muted);margin-bottom:6px;">Files</div>
+          <div class="filesBox">
+            <div id="filesKeep" class="filesList"></div>
+          </div>
+          <div class="approveRow">
+            <button id="approveMove" class="btn primary">Approve &amp; Move</button>
+          </div>
+          <div class="mini" style="margin-top:8px;color:var(--muted);">
+            Tip: toggle any file between Keep/Delete before moving.
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Rename modal -->
+  <div id="renameModal" class="modal" aria-hidden="true">
+    <div class="box" style="max-width:480px;">
+      <div class="modalHeader">
+        <div class="title" style="margin:0;">Rename</div>
+        <button id="closeRename" class="btn sm">Cancel</button>
+      </div>
+      <div style="margin-top:14px;">
+        <div class="mini" style="color:var(--muted); margin-bottom:6px;" id="renameOldName"></div>
+        <input id="renameInput" placeholder="New name" style="margin-top:6px;" />
+        <div class="mini" style="color:var(--red); min-height:18px; margin-top:6px;" id="renameError"></div>
+        <div style="margin-top:14px; display:flex; justify-content:flex-end; gap:10px;">
+          <button id="renameConfirm" class="btn primary">Rename</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Delete confirm modal -->
+  <div id="deleteModal" class="modal" aria-hidden="true">
+    <div class="box" style="max-width:420px;">
+      <div class="modalHeader">
+        <div class="title" style="margin:0; color:var(--red);">Confirm Delete</div>
+        <button id="closeDelete" class="btn sm">Cancel</button>
+      </div>
+      <div style="margin-top:14px;">
+        <div class="mini" style="color:var(--muted); margin-bottom:10px;" id="deleteTargetName"></div>
+        <p style="margin:0; font-size:14px;">This action cannot be undone.</p>
+        <label id="deleteRecursiveRow" class="optRow toggleRow" style="margin-top:14px; display:none;">
+          <span class="toggle">
+            <input id="deleteRecursive" type="checkbox" />
+            <span class="knob" aria-hidden="true"></span>
+          </span>
+          <span class="mini">Delete folder contents recursively</span>
+        </label>
+        <div style="margin-top:14px; display:flex; justify-content:flex-end; gap:10px;">
+          <button id="deleteConfirm" class="btn" style="border-color:rgba(255,69,58,.5); background:rgba(255,69,58,.15); color:var(--red);">Delete</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+
+  <!-- Batch Delete confirm modal -->
+  <div id="deleteBatchModal" class="modal" aria-hidden="true">
+    <div class="box" style="max-width:460px;">
+      <div class="modalHeader">
+        <div class="title" style="margin:0; color:var(--red);">Confirm Delete</div>
+        <button id="closeBatchDelete" class="btn sm">Cancel</button>
+      </div>
+      <div style="margin-top:14px;">
+        <div class="mini" style="color:var(--muted); margin-bottom:10px;" id="deleteBatchSummary"></div>
+        <p style="margin:0; font-size:14px;">This action cannot be undone.</p>
+        <label id="deleteBatchRecursiveRow" class="optRow toggleRow" style="margin-top:14px;">
+          <span class="toggle">
+            <input id="deleteBatchRecursive" type="checkbox" />
+            <span class="knob" aria-hidden="true"></span>
+          </span>
+          <span class="mini">Delete folder contents recursively</span>
+        </label>
+        <div style="margin-top:14px; display:flex; justify-content:flex-end; gap:10px;">
+          <button id="deleteBatchConfirm" class="btn" style="border-color:rgba(255,69,58,.5); background:rgba(255,69,58,.15); color:var(--red);">Delete</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Keyboard Shortcuts overlay -->
+  <div id="kbdOverlay" class="modal" aria-hidden="true">
+    <div class="box sm" style="max-width:340px;">
+      <div class="modalHeader">
+        <div class="title" style="margin:0;">Keyboard Shortcuts</div>
+        <button id="closeKbdOverlay" class="btn sm">Done</button>
+      </div>
+      <div style="margin-top:14px;">
+        <div class="kbdRow"><span>Switch to Queue tab</span><kbd>Q</kbd></div>
+        <div class="kbdRow"><span>Switch to Music tab</span><kbd>M</kbd></div>
+        <div class="kbdRow"><span>Switch to Files tab</span><kbd>F</kbd></div>
+        <div class="kbdRow"><span>Refresh current tab</span><kbd>R</kbd></div>
+        <div class="kbdRow"><span>Focus search</span><kbd>/</kbd></div>
+        <div class="kbdRow"><span>Close modal / cancel</span><kbd>Esc</kbd></div>
+        <div class="kbdRow"><span>Show this overlay</span><kbd>?</kbd></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Pull-to-refresh indicator -->
+  <div id="pullRefreshIndicator"><div class="ptrSpinner"></div></div>
+
+  <!-- Navidrome Link Modal (shown once after login if not linked) -->
+  <div id="navLinkModal" class="modal" aria-hidden="true">
+    <div class="box sm">
+      <div class="modalHeader">
+        <div>
+          <div class="title" style="margin:0;">Link Navidrome Account</div>
+          <div class="mini" style="color:var(--muted); margin-top:4px;">Enable playlist creation for music requests</div>
+        </div>
+        <button id="navLinkSkip" class="btn sm">Skip</button>
+      </div>
+      <p class="hint" style="margin-top:12px;">
+        Your Navidrome credentials are stored securely on the server and used only to create playlists when you import music via the Music tab.
+      </p>
+      <div class="field">
+        <label class="mini">Navidrome username</label>
+        <input id="navLinkUser" placeholder="username" autocomplete="username" />
+      </div>
+      <div class="field">
+        <label class="mini">Navidrome password</label>
+        <input id="navLinkPass" type="password" placeholder="password" autocomplete="current-password" />
+      </div>
+      <div id="navLinkError" class="mini" style="color:var(--red); min-height:18px; margin-bottom:4px;"></div>
+      <div style="display:flex; gap:10px; justify-content:flex-end; margin-top:8px;">
+        <button id="navLinkConfirm" class="btn primary">Link Account</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- SETTINGS TAB -->
+  <div id="settingsTab" class="wrap" style="display:none;">
+    <div class="card" style="margin-top:16px; padding:0; overflow:hidden;">
+      <div class="settingsLayout">
+        <nav class="settingsSidebar">
+          <button class="settingsNavBtn active" data-sp="general">General</button>
+          <button class="settingsNavBtn" data-sp="navidrome">Navidrome</button>
+          <button class="settingsNavBtn" data-sp="sites">Sites</button>
+          <button class="settingsNavBtn" data-sp="storage">Storage</button>
+        </nav>
+        <div class="settingsContent">
+
+          <!-- General -->
+          <div id="settingsPanelGeneral" class="settingsPanelSection">
+            <h2 class="title">General</h2>
+            <div class="field">
+              <label class="mini">API Key <span class="mini" style="font-weight:400;color:var(--muted);">(required for downloads &amp; queue)</span></label>
+              <div class="row">
+                <input id="settingsApiKey" type="password" placeholder="Paste API key…" autocomplete="off" />
+                <button id="settingsApiKeySave" class="btn primary">Save</button>
+              </div>
+            </div>
+            <div style="margin-top:20px; padding-top:16px; border-top:1px solid var(--line);">
+              <h2 class="title" style="font-size:14px; margin-bottom:6px;">Library</h2>
+              <p class="hint">Trigger a rescan so Jellyfin and Navidrome pick up any newly imported files.</p>
+              <button id="rescanBtn" class="btn" style="width:100%;">Rescan Library (Jellyfin + Navidrome)</button>
+              <div id="rescanHint" class="mini" style="margin-top:8px;color:var(--muted);"></div>
+            </div>
+            <div style="margin-top:20px; padding-top:16px; border-top:1px solid var(--line);">
+              <h2 class="title" style="font-size:14px; margin-bottom:6px;">Services</h2>
+              <div id="servicesBox" class="mini" style="color:var(--muted);">Loading…</div>
+              <div style="margin-top:8px;">
+                <a class="btn" href="http://pimedia.local:9091/transmission/web/" target="_blank" rel="noreferrer">Open Transmission</a>
+              </div>
+            </div>
+            <div style="margin-top:20px; padding-top:16px; border-top:1px solid var(--line);" class="mobileOnlySignOut">
+              <button id="mobileLogoutBtn" class="btn" style="width:100%; color:var(--red); border-color:var(--red);">Sign Out</button>
+            </div>
+          </div>
+
+          <!-- Navidrome -->
+          <div id="settingsPanelNavidrome" class="settingsPanelSection" style="display:none;">
+            <h2 class="title">Navidrome</h2>
+            <p class="hint">Link your Navidrome account to enable playlist creation when importing music.</p>
+            <div class="field">
+              <label class="mini">Username</label>
+              <input id="settingsNdUser" placeholder="Navidrome username" autocomplete="username" />
+            </div>
+            <div class="field">
+              <label class="mini">Password</label>
+              <div class="row" style="gap:8px; align-items:center;">
+                <input id="settingsNdPass" type="password" placeholder="Navidrome password" autocomplete="current-password" style="flex:1;" />
+                <button type="button" id="settingsNdPassToggle" class="btn" style="padding:8px 10px; flex-shrink:0;" title="Show/hide password">
+                  <svg id="settingsNdPassEyeIcon" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
+                </button>
+              </div>
+            </div>
+            <div id="settingsNdHint" class="mini" style="color:var(--muted); min-height:16px; margin-bottom:8px;"></div>
+            <button id="settingsNdSave" class="btn primary">Save &amp; Link</button>
+          </div>
+
+          <!-- Sites -->
+          <div id="settingsPanelSites" class="settingsPanelSection" style="display:none;">
+            <h2 class="title">Torrent Sites</h2>
+            <p class="hint">Enable or disable sites in the search dropdown. Preferences saved locally.</p>
+            <div id="settingsSitesList"></div>
+          </div>
+
+          <!-- Storage -->
+          <div id="settingsPanelStorage" class="settingsPanelSection" style="display:none;">
+            <h2 class="title">Storage</h2>
+            <p class="hint">Disk usage on /mnt/media — cached for 5 minutes.</p>
+            <div id="storageStatsContent">
+              <div class="mini" style="color:var(--muted);">Click Refresh to load stats.</div>
+            </div>
+            <button id="storageRefreshBtn" class="btn sm" style="margin-top:12px;">Refresh</button>
+          </div>
+
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- MOBILE BOTTOM TAB BAR -->
+  <div id="mobileTabBar" class="mobileTabBar" style="display:none;">
+    <button class="mobileTabBtn" data-tab="torrent">
+      <svg width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2a5 5 0 015 5v6a5 5 0 01-10 0V7a5 5 0 015-5z"/></svg>
+      <span>Torrent</span>
+    </button>
+    <button class="mobileTabBtn" data-tab="music">
+      <svg width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>
+      <span>Music</span>
+    </button>
+    <button class="mobileTabBtn" data-tab="queue">
+      <svg width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24" aria-hidden="true"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><circle cx="3" cy="6" r="1" fill="currentColor"/><circle cx="3" cy="12" r="1" fill="currentColor"/><circle cx="3" cy="18" r="1" fill="currentColor"/></svg>
+      <span>Queue <span id="mobileQueueBadge" class="queueBadge" style="display:none;"></span></span>
+    </button>
+    <button class="mobileTabBtn" data-tab="files">
+      <svg width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24" aria-hidden="true"><path d="M22 19a2 2 0 01-2 2H4a2 2 0 01-2-2V5a2 2 0 012-2h5l2 3h9a2 2 0 012 2z"/></svg>
+      <span>Files</span>
+    </button>
+  </div>
+
+  <div id="reviewLoadOverlay" class="reviewLoadOverlay" style="display:none;">
+    <div class="spinner"></div>
+    <div class="mini" style="font-size:14px;">Preparing review…</div>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

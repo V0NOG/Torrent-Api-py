@@ -1,0 +1,31 @@
+version: '3.9'
+services:
+  api-py:
+    build: .
+    ports:
+      - "8009:8009"
+
+
+version: "3.8"
+services:
+  audiobookbay-automated:
+    image: ghcr.io/jamesry96/audiobookbay-automated:latest
+    container_name: audiobookbay-automated
+    ports:
+      - "5078:5078"
+    environment:
+      - DOWNLOAD_CLIENT=transmission
+      - DL_SCHEME=http
+      - DL_HOST=127.0.0.1
+      - DL_PORT=9091
+      - DL_USERNAME=YOUR_TRANSMISSION_USER
+      - DL_PASSWORD=YOUR_TRANSMISSION_PASS
+      - DL_CATEGORY=abb-downloader
+      - SAVE_PATH_BASE=/mnt/media/Downloads/Audiobooks
+      - ABB_HOSTNAME=audiobookbay.is
+      - PAGE_LIMIT=5
+      - FLASK_PORT=5078
+      # Optional: add a navbar link inside ABB app (handy)
+      - NAV_LINK_NAME=Back to Torrent UI
+      - NAV_LINK_URL=http://pimedia.local:8009
+    restart: unless-stopped

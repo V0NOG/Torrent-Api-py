@@ -1,3 +1,4 @@
+from torrents.audiobookbay import AudiobookBay
 from torrents.bitsearch import Bitsearch
 from torrents.glodls import Glodls
 from torrents.kickass import Kickass
@@ -229,6 +230,16 @@ all_sites = {
         "categories": [],
         "limit": 20,
     },
+    "audiobookbay": {
+        "website": AudiobookBay,
+        "trending_available": False,
+        "trending_category": False,
+        "search_by_category": False,
+        "recent_available": False,
+        "recent_category_available": False,
+        "categories": ["audiobooks"],
+        "limit": 20,
+    },
     "ybt": {
         "website": YourBittorrent,
         "trending_available": True,
@@ -254,12 +265,20 @@ all_sites = {
 
 sites_config = {
     key: {
-        **site_info, 
-        "website": site_info["website"]._name
+        **site_info,
+        "website": getattr(site_info.get("website"), "__name__", str(site_info.get("website")))
     } for key, site_info in all_sites.items()
 }
 
 def check_if_site_available(site):
-    if site in all_sites.keys():
+    site = str(site).lower().strip()
+
+    # allow callers to request all configured sites
+    if site == "all":
         return all_sites
+
+    # return only the selected site (keeps existing search_router logic working)
+    if site in all_sites:
+        return {site: all_sites[site]}
+
     return False

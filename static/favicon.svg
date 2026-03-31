@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
+  <rect width="32" height="32" rx="7" fill="#0d0d1a"/>
+  <!-- Play triangle, centred, slightly left-weighted for visual balance -->
+  <polygon points="11,8 26,16 11,24" fill="#0a84ff"/>
+  <!-- Small accent bar on the left edge -->
+  <rect x="6" y="8" width="3" height="16" rx="1.5" fill="#0a84ff" opacity="0.55"/>
+</svg>

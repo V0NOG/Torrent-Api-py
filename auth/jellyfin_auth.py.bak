@@ -1,0 +1,107 @@
+"""
+Authenticate users against Jellyfin's /Users/AuthenticateByName endpoint.
+Returns structured user info or raises on failure.
+Never returns Jellyfin credentials to the browser.
+"""
+import os
+from typing import Optional, Dict, Any
+
+try:
+    import httpx
+    _HTTPX = True
+except ImportError:
+    _HTTPX = False
+
+JELLYFIN_URL = (os.getenv("JELLYFIN_URL", "") or "").strip()
+JELLYFIN_API_KEY = (os.getenv("JELLYFIN_API_KEY", "") or "").strip()
+
+# Emby/Jellyfin auth header value (no real token needed for /AuthenticateByName)
+_EMBY_AUTH = (
+    'MediaBrowser Client="TorrentApiPy", Device="Server", DeviceId="torrent-api-py-local", Version="1.0"'
+)
+
+
+async def authenticate_jellyfin(username: str, password: str) -> Dict[str, Any]:
+    """
+    Attempt Jellyfin authentication.
+
+    Returns:
+        {
+            "success": True,
+            "username": str,
+            "jellyfin_id": str,
+            "is_admin": bool,
+            "display_name": str,
+        }
+    Or raises ValueError with a safe message on failure.
+    """
+    if not JELLYFIN_URL:
+        raise ValueError("Jellyfin is not configured on this server")
+    if not _HTTPX:
+        raise ValueError("httpx not installed (required for Jellyfin auth)")
+
+    base = JELLYFIN_URL.rstrip("/")
+    url = f"{base}/Users/AuthenticateByName"
+
+    headers = {
+        "X-Emby-Authorization": _EMBY_AUTH,
+        "Content-Type": "application/json",
+    }
+
+    body = {
+        "Username": username,
+        "Pw": password,
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
+            r = await client.post(url, json=body, headers=headers)
+    except Exception as e:
+        raise ValueError(f"Could not reach Jellyfin: {type(e).__name__}")
+
+    if r.status_code == 401:
+        raise ValueError("Invalid username or password")
+    if r.status_code >= 400:
+        raise ValueError(f"Jellyfin returned HTTP {r.status_code}")
+
+    try:
+        data = r.json()
+    except Exception:
+        raise ValueError("Jellyfin returned an unexpected response")
+
+    user = data.get("User") or {}
+    user_id = user.get("Id") or ""
+    display_name = user.get("Name") or username
+    policy = user.get("Policy") or {}
+    is_admin = bool(policy.get("IsAdministrator", False))
+
+    if not user_id:
+        raise ValueError("Jellyfin auth response missing user ID")
+
+    return {
+        "success": True,
+        "username": username.strip().lower(),
+        "jellyfin_id": user_id,
+        "is_admin": is_admin,
+        "display_name": display_name,
+    }
+
+
+async def get_jellyfin_users() -> list:
+    """
+    Fetch user list (admin use only, for diagnostics).
+    """
+    if not JELLYFIN_URL or not JELLYFIN_API_KEY or not _HTTPX:
+        return []
+    base = JELLYFIN_URL.rstrip("/")
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            r = await client.get(
+                f"{base}/Users",
+                headers={"X-Emby-Token": JELLYFIN_API_KEY},
+            )
+            if r.status_code >= 400:
+                return []
+            return r.json() or []
+    except Exception:
+        return []

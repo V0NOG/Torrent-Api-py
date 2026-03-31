@@ -9,12 +9,11 @@ router = APIRouter(tags=["Search"])
 
 @router.get("/")
 @router.get("")
-async def search_for_torrents(
-    site: str, query: str, limit: Optional[int] = 0, page: Optional[int] = 1
-):
+async def search_for_torrents(site: str, query: str, limit: Optional[int] = 0, page: Optional[int] = 1):
     site = site.lower()
     query = query.lower()
     all_sites = check_if_site_available(site)
+
     if all_sites:
         limit = (
             all_sites[site]["limit"]
@@ -23,12 +22,20 @@ async def search_for_torrents(
         )
 
         resp = await all_sites[site]["website"]().search(query, page, limit)
+
+        # NEW: scraper debug payload
+        if isinstance(resp, dict) and resp.get("blocked"):
+            return error_handler(
+                status_code=status.HTTP_403_FORBIDDEN,
+                json_message={"error": "Website Blocked / Scraper Failed", "debug": resp.get("debug"), "url": resp.get("url")},
+            )
+
         if resp is None:
             return error_handler(
                 status_code=status.HTTP_403_FORBIDDEN,
                 json_message={"error": "Website Blocked Change IP or Website Domain."},
             )
-        elif len(resp["data"]) > 0:
+        elif len(resp.get("data") or []) > 0:
             return resp
         else:
             return error_handler(

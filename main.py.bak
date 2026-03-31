@@ -1,0 +1,1727 @@
+import os
+import re
+import unicodedata
+import time
+import json
+import hmac
+import hashlib
+import secrets
+import asyncio
+import subprocess
+from math import ceil
+from typing import Dict, Any, List, Optional, Tuple
+from pathlib import Path
+from urllib.parse import parse_qs, urlparse
+import urllib.parse
+import shutil
+import uvicorn
+from fastapi import FastAPI, Request, Depends, HTTPException
+from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+
+from routers.v1.search_router import router as search_router
+from routers.v1.trending_router import router as trending_router
+from routers.v1.catergory_router import router as category_router
+from routers.v1.recent_router import router as recent_router
+from routers.v1.combo_routers import router as combo_router
+from routers.v1.sites_list_router import router as site_list_router
+from routers.home_router import router as home_router
+from routers.v1.search_url_router import router as search_url_router
+
+from helper.uptime import getUptime
+from helper.dependencies import authenticate_request
+from helper.torrent_utils import torrent_infohash_hex, magnet_from_btih
+
+from mangum import Mangum
+
+try:
+    import httpx
+except Exception:  # pragma: no cover
+    httpx = None
+
+startTime = time.time()
+
+# ----------------------------
+# Config (env-driven)
+# ----------------------------
+TORRENT_API_KEY = (os.getenv("TORRENT_API_KEY", "") or "").strip()
+
+NAS_INGEST_URL = (os.getenv("NAS_INGEST_URL", "") or "").strip()
+NAS_SHARED_SECRET = (os.getenv("NAS_SHARED_SECRET", "") or "").strip()
+NAS_CALLBACK_SECRET = (os.getenv("NAS_CALLBACK_SECRET", "") or "").strip()
+
+DOWNLOADS_PER_MINUTE = int(os.getenv("DOWNLOADS_PER_MINUTE", "8"))
+MAX_ACTIVE_DOWNLOADS = int(os.getenv("MAX_ACTIVE_DOWNLOADS", "3"))
+QUEUE_MAX_ITEMS = int(os.getenv("QUEUE_MAX_ITEMS", "200"))
+
+_ALLOWED_VIDEO_EXT = {".mkv", ".mp4", ".avi", ".mov", ".m4v", ".wmv"}
+_ALLOWED_SUB_EXT = {".srt", ".ass", ".ssa", ".sub", ".vtt"}
+_ALLOWED_AUDIO_EXT = {".mp3", ".flac", ".m4a", ".aac", ".ogg", ".opus", ".wav"}
+
+_JUNK_EXT = {
+    ".txt", ".url", ".nfo", ".jpg", ".jpeg", ".png", ".gif", ".exe", ".bat", ".cmd",
+    ".sfv", ".md5", ".sha1", ".torrent"
+}
+_JUNK_NAME_HINTS = {"sample", "readme", "proof", "rarbg", "yts", "extratorrent"}
+
+# Navidrome (Subsonic-compatible) scan trigger
+NAVIDROME_URL = (os.getenv("NAVIDROME_URL", "") or "").strip()   # e.g. http://localhost:4533
+NAVIDROME_USER = (os.getenv("NAVIDROME_USER", "") or "").strip()
+NAVIDROME_PASSWORD = (os.getenv("NAVIDROME_PASSWORD", "") or "").strip()
+NAVIDROME_CLIENT = (os.getenv("NAVIDROME_CLIENT", "torrent-api-py") or "torrent-api-py").strip()
+NAVIDROME_API_VER = (os.getenv("NAVIDROME_API_VER", "1.16.1") or "1.16.1").strip()
+
+# ----------------------------
+# Staging + final library routing
+# ----------------------------
+STAGING_BASE_DIR = Path(os.getenv("TORRENT_STAGING_DIR", "/mnt/media/Downloads/Torrents/_staging"))
+
+FINAL_MOVIES_DIR = Path(os.getenv("FINAL_MOVIES_DIR", "/mnt/media/Movies"))
+FINAL_TV_DIR = Path(os.getenv("FINAL_TV_DIR", "/mnt/media/TV"))
+FINAL_MUSIC_DIR = Path(os.getenv("FINAL_MUSIC_DIR", "/mnt/media/Music"))
+FINAL_OTHER_BASE = Path(os.getenv("FINAL_OTHER_BASE", "/mnt/media"))
+
+MIN_FREE_GB = int(os.getenv("MIN_FREE_GB", "20"))
+
+# Optional integrations
+JELLYFIN_URL = (os.getenv("JELLYFIN_URL", "") or "").strip()
+JELLYFIN_API_KEY = (os.getenv("JELLYFIN_API_KEY", "") or "").strip()
+WEBHOOK_URL = (os.getenv("WEBHOOK_URL", "") or "").strip()
+
+# ---- TMDb ----
+TMDB_API_KEY = (os.getenv("TMDB_API_KEY", "") or "").strip()
+TMDB_LANGUAGE = (os.getenv("TMDB_LANGUAGE", "en-AU") or "en-AU").strip()
+TMDB_REGION = (os.getenv("TMDB_REGION", "AU") or "AU").strip()
+TMDB_BASE = "https://api.themoviedb.org/3"
+
+# ----------------------------
+# AudiobookBay (optional auth)
+# ----------------------------
+ABB_COOKIE = (os.getenv("ABB_COOKIE", "") or "").strip()
+ABB_USERNAME = (os.getenv("ABB_USERNAME", "") or "").strip()
+ABB_PASSWORD = (os.getenv("ABB_PASSWORD", "") or "").strip()
+ABB_USER_AGENT = (os.getenv("ABB_USER_AGENT", "Torrent-Api-Py/1.0 (+local)") or "").strip()
+
+ABB_URL = (os.getenv("ABB_URL", "http://127.0.0.1:5078") or "").strip()
+TRANSMISSION_WEB = (os.getenv("TRANSMISSION_WEB", "http://127.0.0.1:9091/transmission/web/") or "").strip()
+TRANSMISSION_RPC = (os.getenv("TRANSMISSION_RPC", "http://127.0.0.1:9091/transmission/rpc") or "").strip()
+
+# Optional: run beets import after moving music
+BEETS_IMPORT_CMD = (os.getenv("BEETS_IMPORT_CMD", "") or "").strip()
+
+_FORBIDDEN_CHARS_RE = re.compile(r'[\/\\:\*\?"<>\|\x00-\x1F\x7F]')
+
+def _disk_free_gb(path: Path) -> int:
+    try:
+        usage = shutil.disk_usage(str(path))
+        return int(usage.free / (1024**3))
+    except Exception:
+        return 0
+
+def _guard_free_space(path: Path):
+    free = _disk_free_gb(path)
+    if free and free < MIN_FREE_GB:
+        raise HTTPException(
+            status_code=507,
+            detail=f"Insufficient disk space: {free}GB free (min {MIN_FREE_GB}GB)."
+        )
+
+def _normalize_category(v: Optional[str]) -> str:
+    s = (v or "all").strip().lower()
+    if s in ("movie", "movies"):
+        return "movies"
+    if s in ("tv", "tvshows", "tv_shows", "tv shows", "shows"):
+        return "tv"
+    if s == "music":
+        return "music"
+    if s in ("other", "custom"):
+        return "other"
+    return "all"
+
+def _final_base_for_category(category: str) -> Path:
+    c = _normalize_category(category)
+    if c == "movies":
+        return FINAL_MOVIES_DIR
+    if c == "tv":
+        return FINAL_TV_DIR
+    if c == "music":
+        return FINAL_MUSIC_DIR
+    if c == "other":
+        return FINAL_OTHER_BASE
+    return FINAL_MOVIES_DIR
+
+def _safe_title(title: str, max_len: int = 120) -> str:
+    t = (title or "").strip()
+    if not t:
+        return "untitled"
+    t = unicodedata.normalize("NFKC", t)
+    t = _FORBIDDEN_CHARS_RE.sub(" ", t)
+    t = " ".join(t.split()).strip()
+    if len(t) > max_len:
+        t = t[:max_len].rstrip()
+    t = t.rstrip(" .")
+    return t or "untitled"
+
+def _safe_filename(name: str, fallback_ext: str) -> str:
+    n = (name or "").strip()
+    if not n:
+        return f"file{fallback_ext}"
+    n = unicodedata.normalize("NFKC", n)
+    n = _FORBIDDEN_CHARS_RE.sub(" ", n)
+    n = " ".join(n.split()).strip().rstrip(" .")
+    if not n:
+        n = "file"
+    # ensure extension
+    if Path(n).suffix == "" and fallback_ext:
+        n = n + fallback_ext
+    return n
+
+def _staging_dir_for(entry: Dict[str, Any]) -> Path:
+    return STAGING_BASE_DIR / f"{entry['id']}_{_safe_title(entry.get('title') or 'untitled', 60)}"
+
+def _guess_tv_show_and_season(title: str):
+    t = (title or "").strip()
+    m = re.search(r"(.*?)[\s\.\-_]+S(\d{1,2})E\d{1,2}\b", t, re.IGNORECASE)
+    if m:
+        show = m.group(1).replace(".", " ").replace("_", " ").replace("-", " ").strip()
+        return show, int(m.group(2))
+    m = re.search(r"(.*?)[\s\.\-_]+Season[\s\.\-_]*(\d{1,2})\b", t, re.IGNORECASE)
+    if m:
+        show = m.group(1).replace(".", " ").replace("_", " ").replace("-", " ").strip()
+        return show, int(m.group(2))
+    return None, None
+
+def _extract_year(title: str) -> Optional[int]:
+    t = (title or "")
+    m = re.search(r"\b(19\d{2}|20\d{2})\b", t)
+    if not m:
+        return None
+    try:
+        return int(m.group(1))
+    except Exception:
+        return None
+
+def _clean_title_for_search(title: str) -> str:
+    t = (title or "").strip()
+    t = re.sub(r"\b(19\d{2}|20\d{2})\b", "", t)
+    t = re.sub(r"\b(1080p|720p|2160p|4k|hdr|dv|bluray|web[-\s]?dl|webrip|hdtv|x264|x265|hevc|aac|dts|atmos)\b", "", t, flags=re.I)
+    t = t.replace(".", " ").replace("_", " ").replace("-", " ")
+    t = " ".join(t.split()).strip()
+    return t or (title or "").strip()
+
+def _tmdb_movie_label(m: Dict[str, Any]) -> str:
+    title = (m.get("title") or "").strip()
+    y = (m.get("release_date") or "")[:4]
+    return f"{title} ({y})".strip()
+
+def _tmdb_tv_label(t: Dict[str, Any]) -> str:
+    name = (t.get("name") or "").strip()
+    y = (t.get("first_air_date") or "")[:4]
+    return f"{name} ({y})".strip()
+
+async def _tmdb_get(path: str, params: Dict[str, Any]) -> Tuple[Dict[str, Any], str]:
+    """
+    Returns (json, debug_string).
+    """
+    if not httpx:
+        return {}, "httpx not installed"
+    if not TMDB_API_KEY:
+        return {}, "TMDB_API_KEY not set"
+    try:
+        p = dict(params or {})
+        p["api_key"] = TMDB_API_KEY
+        p["language"] = TMDB_LANGUAGE
+
+        headers = {"User-Agent": "Torrent-Api-Py/1.0 (+local)"}
+        async with httpx.AsyncClient(timeout=8.0, headers=headers) as client:
+            r = await client.get(f"{TMDB_BASE}{path}", params=p)
+            if r.status_code >= 400:
+                txt = (r.text or "")[:200].replace("\n", " ")
+                return {}, f"TMDb HTTP {r.status_code}: {txt}"
+            js = r.json() if r.content else {}
+            return (js or {}), f"TMDb OK ({path})"
+    except Exception as e:
+        return {}, f"TMDb error: {type(e).__name__}"
+
+async def _tmdb_search_movie(query: str, year: Optional[int] = None) -> Tuple[List[Dict[str, Any]], str]:
+    q = (query or "").strip()
+    if not q:
+        return [], "empty query"
+    params: Dict[str, Any] = {"query": q, "region": TMDB_REGION, "include_adult": False}
+    if year:
+        params["year"] = year
+    data, dbg = await _tmdb_get("/search/movie", params)
+    results = (data.get("results") or [])[:8]
+    if results:
+        return results, dbg
+    # fallback: remove year constraint + try again
+    if year:
+        data2, dbg2 = await _tmdb_get("/search/movie", {"query": q, "region": TMDB_REGION, "include_adult": False})
+        return (data2.get("results") or [])[:8], f"{dbg} • fallback(no-year): {dbg2}"
+    return [], dbg
+
+async def _tmdb_search_tv(query: str) -> Tuple[List[Dict[str, Any]], str]:
+    q = (query or "").strip()
+    if not q:
+        return [], "empty query"
+    params: Dict[str, Any] = {"query": q, "include_adult": False}
+    data, dbg = await _tmdb_get("/search/tv", params)
+    return (data.get("results") or [])[:8], dbg
+
+def _parse_season_episode_from_name(name: str):
+    """
+    Return season (int) or None if not found.
+    Looks for S01E02, s1e2, Season 1 Episode 2, etc.
+    """
+    m = re.search(r"[Ss](\d{1,2})[Ee]\d{1,2}", name)
+    if m:
+        try:
+            return int(m.group(1))
+        except:
+            return None
+    m2 = re.search(r"[Ss]eason[\s\.\-_]*(\d{1,2})\b", name, re.IGNORECASE)
+    if m2:
+        try:
+            return int(m2.group(1))
+        except:
+            return None
+    return None
+
+def _parse_season_from_relpath(rel: str) -> Optional[int]:
+    """
+    Detect season from any part of the relative path, not just filename.
+    Handles:
+      - .../Season 02/...
+      - .../S02/...
+      - filename S02E03...
+    """
+    r = (rel or "").replace("\\", "/")
+    # Check full string for SxxEyy
+    m = re.search(r"[Ss](\d{1,2})[Ee]\d{1,2}", r)
+    if m:
+        try: return int(m.group(1))
+        except: return None
+
+    # Check for Season xx anywhere
+    m2 = re.search(r"[Ss]eason[\s\.\-_]*(\d{1,2})\b", r, re.IGNORECASE)
+    if m2:
+        try: return int(m2.group(1))
+        except: return None
+
+    # Loose folder hint: "/S02/" or "/Season.02/"
+    m3 = re.search(r"(?:^|/)[Ss](\d{1,2})(?:/|$)", r)
+    if m3:
+        try: return int(m3.group(1))
+        except: return None
+
+    return None
+
+def _parse_music_from_filename(fname: str):
+    """
+    If filename looks like "Artist - Album - TrackNumber - Title.ext" or
+    "Artist - Album - Title.ext" attempt to extract Artist & Album & Title.
+    Returns (artist, album, track_title) or (None, None, None).
+    """
+    base = Path(fname).stem
+    parts = [p.strip() for p in re.split(r"[-–—]", base) if p.strip()]
+    if len(parts) >= 3:
+        # Artist - Album - Track - Title  -> join last parts for title
+        artist = parts[0]
+        album = parts[1]
+        title = " - ".join(parts[2:])
+        return artist, album, title
+    if len(parts) == 2:
+        artist, title = parts
+        return artist, None, title
+    return None, None, None
+
+def _is_media_file(p: Path) -> bool:
+    ext = p.suffix.lower()
+    return ext in _ALLOWED_VIDEO_EXT or ext in _ALLOWED_SUB_EXT or ext in _ALLOWED_AUDIO_EXT
+
+def _is_junk_file(p: Path) -> bool:
+    ext = p.suffix.lower()
+    name = p.name.lower()
+    if ext in _JUNK_EXT:
+        return True
+    if any(h in name for h in _JUNK_NAME_HINTS):
+        return True
+    return False
+
+def _collect_files(staging_dir: Path) -> List[Dict[str, Any]]:
+    """
+    Recursively gather files and assign default_action.
+    Returns list of {rel, abs, size, default_action}.
+    """
+    out: List[Dict[str, Any]] = []
+    for p in staging_dir.rglob("*"):
+        if not p.is_file():
+            continue
+        try:
+            rel = str(p.relative_to(staging_dir))
+        except Exception:
+            continue
+
+        ext = p.suffix.lower()
+        size = 0
+        try:
+            size = p.stat().st_size
+        except Exception:
+            size = 0
+
+        if _is_media_file(p):
+            default_action = "keep"
+        elif _is_junk_file(p):
+            default_action = "delete"
+        else:
+            # conservative default: delete unknowns (user can override)
+            default_action = "delete"
+
+        out.append({"rel": rel, "abs": str(p), "size": size, "ext": ext, "default_action": default_action})
+
+    # stable ordering: keep bigger media first helps review for movies
+    out.sort(key=lambda x: (x["default_action"] != "keep", -(x.get("size") or 0), x["rel"]))
+    return out
+
+def _largest_video_rel(files: List[Dict[str, Any]]) -> Optional[str]:
+    vids = [f for f in files if (f.get("ext") or "").lower() in _ALLOWED_VIDEO_EXT]
+    if not vids:
+        return None
+    vids.sort(key=lambda x: (x.get("size") or 0), reverse=True)
+    return vids[0]["rel"]
+
+def _looks_like_episode(rel_or_name: str) -> bool:
+    s = (rel_or_name or "")
+    return bool(re.search(r"[Ss]\d{1,2}[Ee]\d{1,2}", s)) or bool(re.search(r"\b(Episode|Ep)\s*\d+\b", s, re.I))
+
+def _guess_category_from_files(raw_title: str, files: List[Dict[str, Any]]) -> str:
+    """
+    File-based category guess to avoid misclassifying TV packs as movies.
+    Priority:
+      - TV: >=2 episode-like video files
+      - Music: >=2 audio files OR any .m4b
+      - Movie: 1 large video file
+      - Fallback: title heuristic
+    """
+    video = [f for f in files if (f.get("ext") or "").lower() in _ALLOWED_VIDEO_EXT]
+    audio = [f for f in files if (f.get("ext") or "").lower() in _ALLOWED_AUDIO_EXT]
+
+    # TV detection: multiple episode-ish videos
+    tv_hits = 0
+    for f in video:
+        rel = f.get("rel") or ""
+        if _looks_like_episode(rel) or _parse_season_from_relpath(rel) is not None:
+            tv_hits += 1
+    if tv_hits >= 2:
+        return "tv"
+
+    # Music/Audiobook detection
+    if any((f.get("ext") or "").lower() == ".m4b" for f in audio):
+        return "music"
+    if len(audio) >= 2 and len(video) == 0:
+        return "music"
+
+    # Movie detection: single (or effectively single) large video
+    if len(video) >= 1:
+        # if biggest video is very large, likely a movie
+        try:
+            biggest = max([int(v.get("size") or 0) for v in video] or [0])
+        except Exception:
+            biggest = 0
+        if biggest >= 700 * 1024 * 1024 and tv_hits == 0:
+            return "movies"
+
+    # Title heuristic fallback
+    show_guess, _season_guess = _guess_tv_show_and_season(raw_title or "")
+    if show_guess:
+        return "tv"
+    return "movies"
+
+def _guess_music_kind(files: List[Dict[str, Any]]) -> str:
+    """
+    Returns: 'music' or 'audiobook'
+    Heuristics:
+      - any .m4b => audiobook
+      - one very large audio file => audiobook
+      - folder/name hints
+    """
+    audio = [f for f in files if (f.get("ext") or "").lower() in _ALLOWED_AUDIO_EXT]
+    if any((f.get("ext") or "").lower() == ".m4b" for f in audio):
+        return "audiobook"
+
+    # single huge mp3/m4a can be audiobook
+    huge = 0
+    for f in audio:
+        try:
+            if int(f.get("size") or 0) >= 250 * 1024 * 1024:
+                huge += 1
+        except Exception:
+            pass
+    if huge >= 1 and len(audio) <= 3:
+        return "audiobook"
+
+    # name hints
+    hints = ("audiobook", "audible", "aax", "m4b")
+    for f in audio:
+        rel = (f.get("rel") or "").lower()
+        if any(h in rel for h in hints):
+            return "audiobook"
+
+    return "music"
+
+async def _post_webhook(event: str, payload: Dict[str, Any]):
+    if not WEBHOOK_URL or not httpx:
+        return
+    try:
+        body = {"event": event, **payload}
+        async with httpx.AsyncClient(timeout=4.0) as client:
+            await client.post(WEBHOOK_URL, json=body)
+    except Exception:
+        pass
+
+async def _jellyfin_refresh():
+    """
+    More reliable Jellyfin refresh:
+    - waits a moment for filesystem settle
+    - retries
+    - sends both token headers
+    - tries both /Library/Refresh and /library/refresh
+    """
+    if not JELLYFIN_URL or not JELLYFIN_API_KEY or not httpx:
+        return
+
+    base = JELLYFIN_URL.rstrip("/")
+    headers = {
+        "X-Emby-Token": JELLYFIN_API_KEY,
+        "X-MediaBrowser-Token": JELLYFIN_API_KEY,
+    }
+
+    # Let disk/network mounts settle so Jellyfin sees new paths
+    await asyncio.sleep(4.0)
+
+    endpoints = [f"{base}/Library/Refresh", f"{base}/library/refresh"]
+
+    for attempt in range(3):
+        try:
+            async with httpx.AsyncClient(timeout=20.0) as client:
+                ok = False
+                for url in endpoints:
+                    r = await client.post(url, headers=headers)
+                    if r.status_code < 400:
+                        ok = True
+                        break
+                if ok:
+                    return
+        except Exception:
+            pass
+        await asyncio.sleep(1.5 * (attempt + 1))
+
+def _navidrome_auth_params() -> Optional[Dict[str, str]]:
+    """
+    Subsonic auth: u + t(token) + s(salt) + v + c + f=json
+    Token is md5(password + salt). This avoids sending password in plaintext.
+    """
+    if not NAVIDROME_URL or not NAVIDROME_USER or not NAVIDROME_PASSWORD:
+        return None
+    salt = secrets.token_hex(6)
+    token = hashlib.md5((NAVIDROME_PASSWORD + salt).encode("utf-8")).hexdigest()
+    return {
+        "u": NAVIDROME_USER,
+        "t": token,
+        "s": salt,
+        "v": NAVIDROME_API_VER,
+        "c": NAVIDROME_CLIENT,
+        "f": "json",
+    }
+
+# ----------------------------
+# In-memory queue + rate limit
+# ----------------------------
+QUEUE: Dict[str, Dict[str, Any]] = {}
+QUEUE_ORDER: List[str] = []
+RATE_BUCKET: Dict[str, List[float]] = {}
+QUEUE_LOCK = asyncio.Lock()
+RATE_LOCK = asyncio.Lock()
+
+BTIH_INDEX: Dict[str, str] = {}
+
+def _extract_btih(magnet: str) -> Optional[str]:
+    try:
+        if not magnet.startswith("magnet:?"):
+            return None
+        q = parse_qs(urlparse(magnet).query)
+        xts = q.get("xt") or []
+        for xt in xts:
+            if isinstance(xt, str) and xt.lower().startswith("urn:btih:"):
+                return xt.split(":", 2)[-1].strip().lower()
+    except Exception:
+        return None
+    return None
+
+def _transmission_run(args: List[str]) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        args,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        check=False,
+    )
+
+def _transmission_find_id_by_btih(btih: str) -> Optional[int]:
+    if not btih:
+        return None
+    cp = _transmission_run(["transmission-remote", "localhost", "-t", "all", "-i"])
+    out = cp.stdout or ""
+    cur_id = None
+    for line in out.splitlines():
+        s = line.strip()
+        if s.lower().startswith("id:"):
+            try:
+                cur_id = int(s.split(":", 1)[1].strip())
+            except Exception:
+                cur_id = None
+        if s.lower().startswith("hash:"):
+            cur_hash = s.split(":", 1)[1].strip().lower()
+            if cur_id is not None and cur_hash == btih:
+                return cur_id
+    return None
+
+def _parse_rate_kib(s: str) -> Optional[float]:
+    """
+    Accepts: "12.3 KiB/s", "1.2 MiB/s", "0 kB/s" etc
+    Returns KiB/s
+    """
+    try:
+        s = (s or "").strip()
+        m = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*([KMG]i?B)\/s", s, re.I)
+        if not m:
+            return None
+        val = float(m.group(1))
+        unit = m.group(2).lower()
+        if unit.startswith("k"):
+            return val
+        if unit.startswith("m"):
+            return val * 1024.0
+        if unit.startswith("g"):
+            return val * 1024.0 * 1024.0
+        return val
+    except Exception:
+        return None
+
+def _transmission_get_info(tid: int) -> Dict[str, Any]:
+    cp = _transmission_run(["transmission-remote", "localhost", "-t", str(tid), "-i"])
+    out = cp.stdout or ""
+
+    pct = None
+    state = None
+    rate_dl = None
+    rate_ul = None
+    eta = None
+
+    have_pct = None
+    downloaded_bytes = None
+
+    def _parse_bytes(txt: str) -> Optional[int]:
+        # supports: "123.4 MB", "1.2 GiB", "900 kB", "0 bytes"
+        t = (txt or "").strip().lower().replace(",", "")
+        if t.endswith("bytes"):
+            try: return int(float(t.split()[0]))
+            except: return None
+        m = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*([kmgt])i?b", t)
+        if not m:
+            return None
+        val = float(m.group(1))
+        unit = m.group(2)
+        mult = {"k":1024, "m":1024**2, "g":1024**3, "t":1024**4}.get(unit, 1)
+        return int(val * mult)
+
+    for line in out.splitlines():
+        s = line.strip()
+        lo = s.lower()
+
+        if lo.startswith("percent done:"):
+            v = s.split(":", 1)[1].strip().replace("%", "")
+            try:
+                f = float(v)
+                # Transmission reports 0.0000..1.0000; keep in 0..100
+                if f <= 1.0:
+                    f = f * 100.0
+                pct = max(0.0, min(100.0, f))
+            except Exception:
+                pct = None
+
+        elif lo.startswith("have:"):
+            # Example: "Have: 0.00% (0.0 MB verified)"
+            m = re.search(r"have:\s*([0-9]+(?:\.[0-9]+)?)\s*%", lo)
+            if m:
+                try:
+                    have_pct = float(m.group(1))
+                except Exception:
+                    have_pct = None
+
+        elif lo.startswith("downloaded:"):
+            # Example: "Downloaded: 1.2 GB"
+            rhs = s.split(":", 1)[1].strip()
+            downloaded_bytes = _parse_bytes(rhs)
+
+        elif lo.startswith("state:"):
+            state = s.split(":", 1)[1].strip().lower()
+
+        elif lo.startswith("rate download:"):
+            rate_dl = _parse_rate_kib(s.split(":", 1)[1].strip())
+
+        elif lo.startswith("rate upload:"):
+            rate_ul = _parse_rate_kib(s.split(":", 1)[1].strip())
+
+        elif lo.startswith("eta:"):
+            eta = s.split(":", 1)[1].strip()
+
+    return {
+        "percent": pct,
+        "have_pct": have_pct,
+        "downloaded_bytes": downloaded_bytes,
+        "state": state,
+        "rate_download_kib": rate_dl,
+        "rate_upload_kib": rate_ul,
+        "eta": eta,
+        "raw": out[:2000],
+    }
+
+def _now() -> float:
+    return time.time()
+
+def _hmac_sha256(secret: str, body_bytes: bytes) -> str:
+    mac = hmac.new(secret.encode("utf-8"), body_bytes, hashlib.sha256).hexdigest()
+    return f"sha256={mac}"
+
+def _trim_rate_list(ts_list: List[float], window_sec: int = 60) -> List[float]:
+    cutoff = _now() - window_sec
+    return [t for t in ts_list if t >= cutoff]
+
+async def _rate_limit_check(ip: str) -> Optional[str]:
+    async with RATE_LOCK:
+        ts_list = RATE_BUCKET.get(ip, [])
+        ts_list = _trim_rate_list(ts_list, 60)
+        if len(ts_list) >= DOWNLOADS_PER_MINUTE:
+            retry_in = int(max(1, 60 - (_now() - min(ts_list))))
+            RATE_BUCKET[ip] = ts_list
+            return f"Rate limited: too many downloads. Try again in ~{retry_in}s."
+        ts_list.append(_now())
+        RATE_BUCKET[ip] = ts_list
+
+    async with QUEUE_LOCK:
+        active = 0
+        for _id in QUEUE_ORDER:
+            st = (QUEUE.get(_id) or {}).get("status")
+            if st in ("queued", "downloading"):
+                active += 1
+        if active >= MAX_ACTIVE_DOWNLOADS:
+            return f"Too many active downloads (max {MAX_ACTIVE_DOWNLOADS}). Try again shortly."
+
+    return None
+
+
+async def _navidrome_start_scan() -> bool:
+    """
+    Triggers Navidrome library scan using Subsonic-compatible endpoint.
+    """
+    if not httpx:
+        return False
+    params = _navidrome_auth_params()
+    if not params:
+        return False
+
+    try:
+        base = NAVIDROME_URL.rstrip("/")
+        url = f"{base}/rest/startScan.view"
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            r = await client.get(url, params=params)
+            return r.status_code < 400
+    except Exception:
+        return False
+
+async def _queue_add(title: str, site: str, magnet: str, btih: Optional[str]) -> Dict[str, Any]:
+    async with QUEUE_LOCK:
+        qid = secrets.token_hex(8)
+        entry = {
+            "id": qid,
+            "site": site,
+            "title": title,
+            "magnet": magnet,
+            "prepared_meta": None,
+            "approved_meta": None,
+            "btih": btih,
+            "transmission_id": None,
+            "download_dir": None,
+            "status": "queued",
+            "progress": 0,
+            "created_at": int(_now()),
+            "updated_at": int(_now()),
+            "error": None,
+            # transmission live fields
+            "transmission_state": None,
+            "rate_download_kib": None,
+            "rate_upload_kib": None,
+            "eta": None,
+        }
+        QUEUE[qid] = entry
+        QUEUE_ORDER.insert(0, qid)
+
+        if len(QUEUE_ORDER) > QUEUE_MAX_ITEMS:
+            for old_id in QUEUE_ORDER[QUEUE_MAX_ITEMS:]:
+                old = QUEUE.pop(old_id, None)
+                if old and old.get("btih"):
+                    BTIH_INDEX.pop(old["btih"], None)
+            del QUEUE_ORDER[QUEUE_MAX_ITEMS:]
+
+        if btih:
+            BTIH_INDEX[btih] = qid
+
+        return entry
+
+async def _queue_update(qid: str, status: str, progress: Optional[int] = None, error: Optional[str] = None, extra: Optional[Dict[str, Any]] = None):
+    async with QUEUE_LOCK:
+        entry = QUEUE.get(qid)
+        if not entry:
+            return
+        entry["status"] = status
+        if progress is not None:
+            entry["progress"] = max(0, min(100, int(progress)))
+        if error is not None:
+            entry["error"] = error
+        if extra:
+            entry.update(extra)
+        entry["updated_at"] = int(_now())
+
+        if status in ("failed", "completed", "cancelled", "imported"):
+            btih = entry.get("btih")
+            if btih:
+                BTIH_INDEX.pop(btih, None)
+
+async def _add_to_transmission(entry: Dict[str, Any]):
+    try:
+        _guard_free_space(STAGING_BASE_DIR)
+        staging_dir = _staging_dir_for(entry)
+        staging_dir.mkdir(parents=True, exist_ok=True)
+        entry["download_dir"] = str(staging_dir)
+
+        cp = _transmission_run(
+            ["transmission-remote", "localhost", "-a", entry["magnet"], "-w", str(staging_dir)]
+        )
+
+        out = (cp.stdout or "").lower()
+        if "duplicate torrent" in out or "duplicate" in out:
+            await _queue_update(entry["id"], "failed", error="Duplicate torrent (already added)")
+            return
+
+        btih = entry.get("btih")
+        if btih:
+            tid = _transmission_find_id_by_btih(btih)
+            if tid is not None:
+                entry["transmission_id"] = tid
+
+        await _queue_update(entry["id"], "downloading", progress=0)
+        await _post_webhook("downloading", {"id": entry["id"], "title": entry.get("title")})
+    except Exception as e:
+        await _queue_update(entry["id"], "failed", error=str(e))
+        await _post_webhook("failed", {"id": entry["id"], "error": str(e)})
+
+async def _queue_poller():
+    while True:
+        try:
+            async with QUEUE_LOCK:
+                ids = list(QUEUE_ORDER)
+
+            for qid in ids:
+                async with QUEUE_LOCK:
+                    entry = QUEUE.get(qid)
+                    if not entry:
+                        continue
+                    st = entry.get("status")
+                    tid = entry.get("transmission_id")
+
+                if st not in ("queued", "downloading", "completed", "ready"):
+                    continue
+
+                if tid is None:
+                    btih = entry.get("btih")
+                    if btih:
+                        tid = _transmission_find_id_by_btih(btih)
+                        if tid is not None:
+                            async with QUEUE_LOCK:
+                                if qid in QUEUE:
+                                    QUEUE[qid]["transmission_id"] = tid
+                    if tid is None:
+                        continue
+
+                info = _transmission_get_info(int(tid))
+                percent = info.get("percent")
+                state = (info.get("state") or "").lower()
+
+                prog = 0
+                if percent is not None:
+                    prog = int(max(0, min(100, round(float(percent)))))
+
+                extra = {
+                    "transmission_state": state,
+                    "rate_download_kib": info.get("rate_download_kib"),
+                    "rate_upload_kib": info.get("rate_upload_kib"),
+                    "eta": info.get("eta"),
+                }
+
+                # Ready only when both percent AND state indicate completion
+                have_pct = info.get("have_pct")
+                downloaded_bytes = info.get("downloaded_bytes")
+
+                is_finishedish = state in ("idle", "finished", "seeding", "stopped")
+                is_really_complete = (have_pct is not None and have_pct >= 99.9) or (prog >= 100 and (downloaded_bytes or 0) > 0)
+
+                if is_finishedish and is_really_complete:
+                    await _queue_update(qid, "ready", progress=100, extra=extra)
+                elif state in ("downloading", "download", "up & down", "up and down", "verifying"):
+                    await _queue_update(qid, "downloading", progress=prog, extra=extra)
+                else:
+                    await _queue_update(qid, st, progress=prog if st == "downloading" else entry.get("progress", 0), extra=extra)
+        except Exception:
+            pass
+
+        await asyncio.sleep(2)
+
+def _require_ui_api_key(req: Request):
+    if not TORRENT_API_KEY:
+        raise HTTPException(status_code=500, detail="Server misconfigured: TORRENT_API_KEY not set")
+    key = (req.headers.get("x-api-key") or "").strip()
+    if not key or not secrets.compare_digest(key, TORRENT_API_KEY):
+        raise HTTPException(status_code=401, detail="Unauthorized: missing/invalid API key")
+
+def _require_nas_signature(req: Request, raw_body: bytes):
+    if not NAS_CALLBACK_SECRET:
+        raise HTTPException(status_code=500, detail="Server misconfigured: NAS_CALLBACK_SECRET not set")
+    sig = (req.headers.get("x-signature") or "").strip()
+    expected = _hmac_sha256(NAS_CALLBACK_SECRET, raw_body)
+    if not sig or not secrets.compare_digest(sig, expected):
+        raise HTTPException(status_code=401, detail="Unauthorized: bad signature")
+
+app = FastAPI(
+    title="Torrent-Api-Py",
+    version="1.0.2",
+    description="Local torrent ingestion + review",
+    docs_url="/docs",
+    redirect_slashes=True,
+)
+
+async def _probe_url(url: str, timeout: float = 2.5) -> Dict[str, Any]:
+    """
+    Server-side health probe for internal services.
+    Uses httpx if available; falls back to urllib.
+    Returns: { ok: bool, status: int|None, error: str|None }
+    """
+    if not url:
+        return {"ok": False, "status": None, "error": "not configured"}
+
+    # Prefer httpx (already optional-imported above)
+    if httpx:
+        try:
+            async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, trust_env=False) as client:
+                r = await client.get(url)
+                return {"ok": r.status_code < 500, "status": r.status_code, "error": None}
+        except Exception as e:
+            return {"ok": False, "status": None, "error": type(e).__name__}
+
+    # Fallback: urllib
+    try:
+        import urllib.request
+        with urllib.request.urlopen(url, timeout=timeout) as resp:
+            code = getattr(resp, "status", 200)
+            return {"ok": code < 500, "status": code, "error": None}
+    except Exception as e:
+        return {"ok": False, "status": None, "error": type(e).__name__}
+
+
+async def _probe_transmission_rpc(url: str, timeout: float = 2.5) -> Dict[str, Any]:
+    if not url:
+        return {"ok": False, "status": None, "error": "not configured"}
+
+    if httpx:
+        try:
+            async with httpx.AsyncClient(timeout=timeout, trust_env=False) as client:
+                # Transmission RPC expects POST; 409 is normal without session header
+                r = await client.post(url, content=b"")
+                ok = (r.status_code < 500) or (r.status_code == 409)
+                return {"ok": ok, "status": r.status_code, "error": None}
+        except Exception as e:
+            return {"ok": False, "status": None, "error": type(e).__name__}
+
+    # urllib fallback (POST)
+    try:
+        import urllib.request
+        req = urllib.request.Request(url, data=b"", method="POST")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            code = getattr(resp, "status", 200)
+            ok = (code < 500) or (code == 409)
+            return {"ok": ok, "status": code, "error": None}
+    except Exception as e:
+        # urllib raises for 409; treat as healthy
+        if getattr(e, "code", None) == 409:
+            return {"ok": True, "status": 409, "error": None}
+        return {"ok": False, "status": None, "error": type(e).__name__}
+
+@app.get("/api/services/health")
+async def services_health():
+    """
+    Lightweight internal health status for the UI.
+    No secrets returned.
+    """
+    # Pick a probe URL for Transmission RPC
+    transmission_probe = (TRANSMISSION_RPC or "").strip()
+    if not transmission_probe:
+        base = (TRANSMISSION_WEB or "").rstrip("/")
+        # If configured as /transmission/web, convert to /transmission/rpc
+        if base.endswith("/transmission/web"):
+            transmission_probe = base[:-len("/web")] + "/rpc"
+        else:
+            transmission_probe = "http://127.0.0.1:9091/transmission/rpc"
+
+    transmission = await _probe_transmission_rpc(transmission_probe)
+    abb = await _probe_url(ABB_URL)
+
+    jellyfin = await _probe_url(JELLYFIN_URL.rstrip("/") + "/System/Info/Public") if JELLYFIN_URL else {"ok": False, "status": None, "error": "not configured"}
+    navidrome = await _probe_url(NAVIDROME_URL.rstrip("/") + "/") if NAVIDROME_URL else {"ok": False, "status": None, "error": "not configured"}
+
+    return {
+        "ok": True,
+        "services": {
+            "transmission": transmission,
+            "audiobookbay": abb,
+            "jellyfin": jellyfin,
+            "navidrome": navidrome,
+        },
+        "uptime_seconds": int(time.time() - startTime),
+    }
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.on_event("startup")
+async def _startup():
+    STAGING_BASE_DIR.mkdir(parents=True, exist_ok=True)
+    asyncio.create_task(_queue_poller())
+
+@app.get("/health")
+async def health_route(req: Request):
+    return JSONResponse(
+        {"app":"Torrent-Api-Py","version":"v1.0.2","ip":req.client.host,"uptime":ceil(getUptime(startTime))}
+    )
+
+@app.get("/api/v1/prepare/{qid}")
+async def prepare_move(qid: str, req: Request):
+    _require_ui_api_key(req)
+
+    async with QUEUE_LOCK:
+        entry = QUEUE.get(qid)
+        if not entry:
+            raise HTTPException(status_code=404, detail="Not found")
+
+    if entry.get("status") not in ("ready", "completed"):
+        raise HTTPException(status_code=409, detail="Not ready to process yet")
+
+    staging_dir = Path(entry.get("download_dir") or "")
+    if not staging_dir.exists():
+        raise HTTPException(status_code=404, detail="Staging dir missing")
+
+    files = _collect_files(staging_dir)
+
+    # Add UI settings suggestions (frontend will show toggles)
+    ui_settings = {
+        # default on: auto-split season files into per-season folders
+        "tv_auto_split_default": True,
+        # music: suggest running beets import to use tag-based layout (recommended)
+        "music_recommend_beets": bool(BEETS_IMPORT_CMD),
+        # Provide a suggested music folder example if not using beets
+        "music_example_structure": "Artist/Album/Track - Title.ext",
+    }
+
+    # Sensible defaults:
+    # - movies: keep largest video + subtitles by default; user can override
+    # - tv packs: keep all media by default (already default_action=keep for media)
+    # - music: keep all audio by default
+    # Sensible defaults:
+    # IMPORTANT: guess category using FILES first (prevents TV packs being treated as movies)
+    raw_title = entry.get("title") or ""
+    norm_cat_guess = _guess_category_from_files(raw_title, files)
+
+    # If ABB was the source, default to Music + Audiobook in Review
+    src_site = (entry.get("site") or "").strip().lower()
+    if src_site == "audiobookbay":
+        norm_cat_guess = "music"
+
+    music_kind_guess = _guess_music_kind(files) if norm_cat_guess == "music" else None
+    if src_site == "audiobookbay":
+        music_kind_guess = "audiobook"
+
+    ui_settings["music_kind_guess"] = music_kind_guess
+
+    show_guess, season_guess = _guess_tv_show_and_season(raw_title)
+    if norm_cat_guess == "tv" and not show_guess:
+        # we can still use the raw title as show guess in UI
+        show_guess = _clean_title_for_search(raw_title)
+
+    suggested = {"kind": norm_cat_guess}
+    candidates: List[Dict[str, Any]] = []
+    tmdb_debug = ""
+
+    if norm_cat_guess == "movies":
+        year = _extract_year(raw_title)
+        query = _clean_title_for_search(raw_title)
+        results, dbg = await _tmdb_search_movie(query, year=year)
+        tmdb_debug = dbg
+        for m in results:
+            candidates.append({
+                "source": "tmdb",
+                "kind": "movie",
+                "tmdb_id": m.get("id"),
+                "title": m.get("title"),
+                "year": (m.get("release_date") or "")[:4] or None,
+                "label": _tmdb_movie_label(m),
+            })
+        if candidates:
+            suggested.update(candidates[0])
+
+        # adjust defaults: keep largest video, keep subs; delete other videos by default
+        largest = _largest_video_rel(files)
+        for f in files:
+            ext = (f.get("ext") or "").lower()
+            if ext in _ALLOWED_VIDEO_EXT:
+                f["default_action"] = "keep" if (largest and f["rel"] == largest) else "delete"
+            elif ext in _ALLOWED_SUB_EXT:
+                f["default_action"] = "keep"
+
+    elif norm_cat_guess == "tv":
+        query = _clean_title_for_search(show_guess or raw_title)
+        results, dbg = await _tmdb_search_tv(query)
+        tmdb_debug = dbg
+        for t in results:
+            candidates.append({
+                "source": "tmdb",
+                "kind": "tv",
+                "tmdb_id": t.get("id"),
+                "show": t.get("name"),
+                "year": (t.get("first_air_date") or "")[:4] or None,
+                "label": _tmdb_tv_label(t),
+            })
+        if candidates:
+            suggested.update(candidates[0])
+        suggested["season"] = int(season_guess or 1)
+
+    async with QUEUE_LOCK:
+        if entry["id"] in QUEUE:
+            QUEUE[entry["id"]]["prepared_meta"] = {"suggested": suggested, "candidates": candidates}
+
+    return JSONResponse({
+        "success": True,
+        "suggested": suggested,
+        "candidates": candidates,
+        "tmdb_debug": tmdb_debug,
+        "id": entry["id"],
+        "title": entry.get("title"),
+        "category": norm_cat_guess,
+        "staging_dir": str(staging_dir),
+        "files": [{"rel": f["rel"], "size": f.get("size", 0), "default_action": f.get("default_action")} for f in files],
+        "transmission_state": entry.get("transmission_state"),
+        "ui_settings": ui_settings,
+    })
+
+def _resolve_under(base: Path, rel: str) -> Path:
+    # prevent path traversal
+    rel = (rel or "").lstrip("/").replace("\\", "/")
+    p = (base / rel).resolve()
+    b = base.resolve()
+    if not str(p).startswith(str(b) + os.sep) and p != b:
+        raise HTTPException(status_code=400, detail=f"Invalid path: {rel}")
+    return p
+
+@app.post("/api/v1/process")
+async def process_move(req: Request):
+    _require_ui_api_key(req)
+    data = await req.json()
+
+    qid = (data.get("id") or "").strip()
+    if not qid:
+        raise HTTPException(status_code=400, detail="Missing id")
+
+    async with QUEUE_LOCK:
+        entry = QUEUE.get(qid)
+        if not entry:
+            raise HTTPException(status_code=404, detail="Not found")
+
+    if entry.get("status") not in ("ready", "completed"):
+        raise HTTPException(status_code=409, detail="Not ready to process yet")
+
+    staging_dir = Path(entry.get("download_dir") or "")
+    if not staging_dir.exists():
+        raise HTTPException(status_code=404, detail="Staging dir missing")
+
+    dest_type = _normalize_category((data.get("dest_type") or "movies"))
+    custom_subfolder = (data.get("custom_subfolder") or "").strip()
+    meta = data.get("meta") or {}
+    name_override = data.get("name_override") or {}
+
+    keep_rels = data.get("keep_files") or []
+    del_rels  = data.get("delete_files") or []
+
+    file_name_overrides = data.get("file_name_overrides") or {}
+    if not isinstance(file_name_overrides, dict):
+        file_name_overrides = {}
+
+    # Build selected actions safely
+    selected_keep: List[Path] = []
+    selected_del: List[Path] = []
+
+    # If client didn't send lists, fall back to server defaults
+    if not isinstance(keep_rels, list) or not isinstance(del_rels, list):
+        keep_rels, del_rels = [], []
+
+    if keep_rels or del_rels:
+        for rel in keep_rels:
+            p = _resolve_under(staging_dir, str(rel))
+            if p.is_file():
+                selected_keep.append(p)
+        for rel in del_rels:
+            p = _resolve_under(staging_dir, str(rel))
+            if p.is_file():
+                selected_del.append(p)
+    else:
+        # server defaults
+        files = _collect_files(staging_dir)
+        for f in files:
+            p = _resolve_under(staging_dir, f["rel"])
+            if f.get("default_action") == "keep":
+                selected_keep.append(p)
+            else:
+                selected_del.append(p)
+
+    # final destination dir
+    dest_base = _final_base_for_category(dest_type)
+    _guard_free_space(dest_base)
+
+    if dest_type == "other":
+        # Put under /mnt/media/<customSubfolder>
+        safe_sub = _safe_title(custom_subfolder.replace("/", " "), 120) if custom_subfolder else "Other"
+        # Allow real nesting like "Other/Downloads" by sanitizing segments
+        parts = [p for p in custom_subfolder.replace("\\", "/").split("/") if p.strip()]
+        if parts:
+            clean_parts = [_safe_title(seg, 80) for seg in parts]
+            dest_dir = FINAL_OTHER_BASE.joinpath(*clean_parts)
+        else:
+            dest_dir = FINAL_OTHER_BASE / safe_sub
+    elif dest_type == "movies":
+        title = (name_override.get("title") or meta.get("title") or meta.get("name") or entry.get("title") or "Untitled").strip()
+        year = (name_override.get("year") or meta.get("year") or "")
+        year = str(year)[:4].strip() if year else ""
+        folder = _safe_title(title, 120)
+        if year:
+            folder = f"{folder} ({year})"
+        dest_dir = FINAL_MOVIES_DIR / folder
+    elif dest_type == "tv":
+        show = (name_override.get("title") or meta.get("show") or meta.get("title") or entry.get("title") or "Untitled Show").strip()
+        show = _safe_title(show, 120)
+
+        tv_year = (name_override.get("year") or meta.get("year") or "")
+        tv_year = str(tv_year)[:4].strip() if tv_year else ""
+
+        if tv_year:
+            show_folder = f"{show} ({tv_year})"
+        else:
+            show_folder = show
+
+        try:
+            season = int(name_override.get("season") or meta.get("season") or 1)
+        except Exception:
+            season = 1
+        season = max(1, season)
+
+        dest_dir = FINAL_TV_DIR / show_folder / f"Season {season:02d}"
+    elif dest_type == "music":
+        dest_dir = FINAL_MUSIC_DIR / "_incoming"
+    else:
+        dest_dir = dest_base / _safe_title(entry.get("title") or "untitled", 120)
+
+    # CRITICAL FIX: always create destination before moving
+    # Ensure destination exists (some branches will create subdirs too)
+    try:
+        dest_dir.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        await _queue_update(qid, "failed", error=f"Dest create failed: {type(e).__name__}: {e}")
+        return JSONResponse({"success": False, "message": "Destination creation failed"})
+
+    # Delete junk BEFORE moving
+    for p in selected_del:
+        try:
+            p.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    moved_any = False
+    move_errors: List[str] = []
+    moved_targets: List[str] = []
+    moved_count = 0
+    tv_season_counts: Dict[int, int] = {}
+
+    # Normalize category
+    norm_cat = _normalize_category(dest_type)
+
+    # Build an "approved" dict for TV auto-split naming
+    # (uses same fields you already accept)
+    approved = {}
+    if norm_cat == "tv":
+        approved["show"] = (name_override.get("title") or meta.get("show") or meta.get("title") or entry.get("title") or "Untitled Show").strip()
+        approved["year"] = (name_override.get("year") or meta.get("year") or "")
+        try:
+            approved["season"] = int(name_override.get("season") or meta.get("season") or 1)
+        except Exception:
+            approved["season"] = 1
+
+    # meta might contain UI toggles (if not present, use sane defaults)
+    auto_split_tv = bool((meta.get("options") or {}).get("tv_auto_split", True))
+    run_beets = bool((meta.get("options") or {}).get("music_run_beets", bool(BEETS_IMPORT_CMD)))
+
+    # Helper to move a single file safely
+    def _safe_move(src: Path, target: Path, rel_hint: Optional[str] = None):
+        """
+        Move src -> target (with optional filename override).
+        Returns (ok: bool, target_path: str|None, err: str|None)
+        """
+        try:
+            final_target = target
+
+            # Apply per-file rename override (if provided by UI)
+            if rel_hint and rel_hint in file_name_overrides:
+                override = str(file_name_overrides.get(rel_hint) or "").strip()
+                if override:
+                    safe = _safe_filename(override, src.suffix)
+                    final_target = final_target.with_name(safe)
+
+            final_target.parent.mkdir(parents=True, exist_ok=True)
+
+            # If file already exists, avoid clobbering: add suffix
+            if final_target.exists():
+                stem = final_target.stem
+                ext = final_target.suffix
+                for i in range(1, 1000):
+                    candidate = final_target.with_name(f"{stem} ({i}){ext}")
+                    if not candidate.exists():
+                        final_target = candidate
+                        break
+
+            shutil.move(str(src), str(final_target))
+            return True, str(final_target), None
+        except Exception as e:
+            return False, None, f"{type(e).__name__}: {e}"
+
+    # ---- TV handling (always enforce Season folders) ----
+    if norm_cat == "tv":
+        base_show = _safe_title(approved.get("show") or entry.get("title") or "Untitled Show", 120)
+        tv_year = str((approved.get("year") or "")).strip()[:4]
+        show_name = f"{base_show} ({tv_year})" if tv_year else base_show
+
+        for p in selected_keep:
+            try:
+                try:
+                    rel = str(p.relative_to(staging_dir)).replace("\\", "/")
+                except Exception:
+                    rel = p.name
+
+                season = None
+                if auto_split_tv:
+                    season = _parse_season_from_relpath(rel) or _parse_season_episode_from_name(p.name)
+
+                if season is None:
+                    season = int(approved.get("season") or 1)
+
+                season = max(1, int(season))
+
+                target_dir = FINAL_TV_DIR / show_name / f"Season {season:02d}"
+                target = target_dir / p.name
+
+                ok, tgt, err = _safe_move(p, target, rel_hint=rel)
+                if ok:
+                    moved_any = True
+                    moved_count += 1
+                    moved_targets.append(tgt)
+                    tv_season_counts[season] = tv_season_counts.get(season, 0) + 1
+                else:
+                    move_errors.append(f"{p}: {err}")
+            except Exception as e:
+                move_errors.append(f"{p}: {type(e).__name__}: {e}")
+
+    # Music: Artist/Album/Track - Title (best-effort filename parsing)
+    elif norm_cat == "music":
+        opts = (meta.get("options") or {})
+        music_kind = ((meta.get("music") or {}).get("kind") or opts.get("music_kind") or "music").strip().lower()
+        if music_kind not in ("music", "audiobook"):
+            music_kind = "music"
+
+        music_meta = (meta.get("music") or {})
+        artist = _safe_title((music_meta.get("artist") or "").strip(), 120)
+        album  = _safe_title((music_meta.get("album") or "").strip(), 120)
+        myear  = str((music_meta.get("year") or "")).strip()[:4]
+
+        author = _safe_title((music_meta.get("author") or "").strip(), 120)
+        book   = _safe_title((music_meta.get("book") or "").strip(), 120)
+        byear  = str((music_meta.get("year") or "")).strip()[:4]
+
+        # Decide base destination
+        if music_kind == "audiobook":
+            # /Music/Audiobooks/Author/Book (Year)/
+            ab_root = dest_base / "Audiobooks"
+            a_dir = author or "Unknown Author"
+            b_dir = book or "Unknown Book"
+            if byear:
+                b_dir = f"{b_dir} ({byear})"
+            dest_dir_effective = ab_root / a_dir / b_dir
+        else:
+            # /Music/Artist/Album (Year)/
+            if artist:
+                a_dir = artist
+            else:
+                a_dir = "_incoming"
+            if album:
+                alb = album
+                if myear:
+                    alb = f"{alb} ({myear})"
+                dest_dir_effective = dest_base / a_dir / alb
+            else:
+                dest_dir_effective = dest_base / a_dir / "_single"
+
+        try:
+            dest_dir_effective.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            await _queue_update(qid, "failed", error=f"Dest create failed: {type(e).__name__}: {e}")
+            return JSONResponse({"success": False, "message": "Destination creation failed"})
+
+        for p in selected_keep:
+            try:
+                try:
+                    rel = str(p.relative_to(staging_dir)).replace("\\", "/")
+                except Exception:
+                    rel = p.name
+
+                target = dest_dir_effective / p.name
+                ok, tgt, err = _safe_move(p, target, rel_hint=rel)
+                if ok:
+                    moved_any = True
+                    moved_count += 1
+                    moved_targets.append(tgt)
+                else:
+                    move_errors.append(f"{p}: {err}")
+            except Exception as e:
+                move_errors.append(f"{p}: {type(e).__name__}: {e}")
+
+        # Optionally run beets import if user requested and BEETS_IMPORT_CMD is set (music only)
+        if music_kind == "music" and run_beets and BEETS_IMPORT_CMD:
+            try:
+                subprocess.Popen(BEETS_IMPORT_CMD.split() + [str(dest_dir_effective)])
+            except Exception:
+                pass
+
+        # overwrite dest_dir for webhook/return payload
+        dest_dir = dest_dir_effective
+
+    # Default single-folder move (movies / other)
+    else:
+        for p in selected_keep:
+            try:
+                try:
+                    rel = str(p.relative_to(staging_dir)).replace("\\", "/")
+                except Exception:
+                    rel = p.name
+
+                ok, tgt, err = _safe_move(p, dest_dir / p.name, rel_hint=rel)
+                if ok:
+                    moved_any = True
+                    moved_count += 1
+                    moved_targets.append(tgt)
+                else:
+                    move_errors.append(f"{p}: {err}")
+            except Exception as e:
+                move_errors.append(f"{p}: {type(e).__name__}: {e}")
+
+    if not moved_any:
+        await _queue_update(
+            qid,
+            "failed",
+            error="No usable media files found to move -- " + "; ".join(move_errors[:3]),
+        )
+        return JSONResponse({"success": False, "message": "No usable media files found", "errors": move_errors})
+
+    # Cleanup staging directory (remove empty dirs)
+    try:
+        for _ in range(5):
+            for d in sorted(staging_dir.rglob("*"), key=lambda x: len(str(x)), reverse=True):
+                if d.is_dir():
+                    try:
+                        d.rmdir()
+                    except Exception:
+                        pass
+            try:
+                staging_dir.rmdir()
+                break
+            except Exception:
+                break
+    except Exception:
+        pass
+
+    # Remove torrent from Transmission (do NOT delete data on disk beyond what we already moved/deleted)
+    tid = entry.get("transmission_id")
+    if tid is not None:
+        _transmission_run(["transmission-remote", "localhost", "-t", str(tid), "-S"])
+        _transmission_run(["transmission-remote", "localhost", "-t", str(tid), "-r"])
+
+    await _queue_update(qid, "imported", progress=100)
+
+    # Refresh libraries
+    await _jellyfin_refresh()
+
+    navidrome_triggered = False
+    if dest_type == "music":
+        navidrome_triggered = await _navidrome_start_scan()
+
+    await _post_webhook("imported", {
+        "id": qid,
+        "title": entry.get("title"),
+        "dest": str(dest_dir),
+        "navidrome_scan": navidrome_triggered,
+    })
+
+    tv_summary = None
+    if norm_cat == "tv":
+        base = str(FINAL_TV_DIR / show_name)
+        seasons = [{"season": s, "path": f"{base}/Season {s:02d}", "files": tv_season_counts.get(s, 0)} for s in sorted(tv_season_counts.keys())]
+        tv_summary = {
+            "show_base": base,
+            "seasons": seasons,
+        }
+
+    return JSONResponse({
+        "success": True,
+        "destination_dir": str(dest_dir),
+        "moved_files_count": moved_count,
+        "moved_paths_sample": moved_targets[:25],
+        "tv_summary": tv_summary,
+        "navidrome_scan": navidrome_triggered,
+    })
+
+def _is_probable_url(s: str) -> bool:
+    s = (s or "").strip().lower()
+    return s.startswith("http://") or s.startswith("https://")
+
+async def _fetch_torrent_bytes(torrent_url: str) -> bytes:
+    if not httpx:
+        raise HTTPException(status_code=500, detail="httpx not installed (required for torrent_url)")
+
+    url = (torrent_url or "").strip()
+    if not _is_probable_url(url):
+        raise HTTPException(status_code=400, detail="Invalid torrent_url")
+
+    headers = {"User-Agent": ABB_USER_AGENT}
+
+    # Cookie-based auth (recommended if ABB requires login)
+    if ABB_COOKIE:
+        headers["Cookie"] = ABB_COOKIE
+
+    # NOTE: username/password flows on ABB vary (forms/captcha). We keep envs for future,
+    # but do NOT attempt brittle auto-login here. Prefer ABB_COOKIE.
+    async with httpx.AsyncClient(timeout=20.0, headers=headers, follow_redirects=True) as client:
+        r = await client.get(url)
+        if r.status_code >= 400 or not r.content:
+            txt = (r.text or "")[:200].replace("\n", " ")
+            raise HTTPException(status_code=502, detail=f"Failed to fetch .torrent (HTTP {r.status_code}): {txt}")
+        # Some sites respond HTML when blocked; basic sniff:
+        if r.headers.get("content-type", "").lower().startswith("text/html"):
+            # still might be a torrent with wrong header, but usually indicates block/login
+            head = (r.text or "")[:200].lower()
+            if "<html" in head or "login" in head:
+                raise HTTPException(status_code=502, detail="Fetched HTML instead of .torrent (blocked or login required)")
+        return bytes(r.content)
+
+# Existing API routers (unchanged)
+app.include_router(search_router, prefix="/api/v1/search", dependencies=[Depends(authenticate_request)])
+app.include_router(trending_router, prefix="/api/v1/trending", dependencies=[Depends(authenticate_request)])
+app.include_router(category_router, prefix="/api/v1/category", dependencies=[Depends(authenticate_request)])
+app.include_router(recent_router, prefix="/api/v1/recent", dependencies=[Depends(authenticate_request)])
+app.include_router(combo_router, prefix="/api/v1/all", dependencies=[Depends(authenticate_request)])
+app.include_router(site_list_router, prefix="/api/v1/sites", dependencies=[Depends(authenticate_request)])
+app.include_router(search_url_router, prefix="/api/v1/search_url", dependencies=[Depends(authenticate_request)])
+app.include_router(home_router, prefix="/readme")
+
+@app.post("/api/v1/download")
+async def trigger_download(req: Request):
+    _require_ui_api_key(req)
+
+    data = await req.json()
+    site = (data.get("site") or "piratebay").strip()
+    title = (data.get("title") or "").strip()
+    magnet = (data.get("magnet") or "").strip()
+
+    # Frontend sends "torrent" (URL). Keep "torrent_url" for backward compat.
+    torrent_url = (data.get("torrent") or data.get("torrent_url") or "").strip()
+
+    # Accept either magnet OR torrent_url
+    if not title:
+        raise HTTPException(status_code=400, detail="Invalid payload: title is required")
+
+    if magnet:
+        if not magnet.startswith("magnet:?"):
+            raise HTTPException(status_code=400, detail="Invalid magnet")
+        btih = _extract_btih(magnet)
+        if not btih:
+            raise HTTPException(status_code=400, detail="Invalid magnet: missing BTIH")
+    else:
+        # torrent_url path (AudiobookBay commonly provides .torrent)
+        if not torrent_url:
+            raise HTTPException(status_code=400, detail="Invalid payload: magnet or torrent is required")
+
+        torrent_bytes = await _fetch_torrent_bytes(torrent_url)
+        try:
+            btih = torrent_infohash_hex(torrent_bytes)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Invalid .torrent: {type(e).__name__}")
+
+        # Build a magnet so the rest of the pipeline stays unchanged
+        magnet = magnet_from_btih(btih)
+
+    async with QUEUE_LOCK:
+        existing_qid = BTIH_INDEX.get(btih)
+        if existing_qid and existing_qid in QUEUE:
+            existing = QUEUE[existing_qid]
+            st = existing.get("status")
+            if st in ("queued", "downloading"):
+                return JSONResponse({"success": True, "id": existing_qid, "deduped": True, "message": "Already added"})
+
+    ip = req.client.host if req.client else "unknown"
+    blocked = await _rate_limit_check(ip)
+    if blocked:
+        return JSONResponse({"success": False, "error": "rate_limited", "message": blocked}, status_code=429)
+
+    entry = await _queue_add(title=title, site=site, magnet=magnet, btih=btih)
+    asyncio.create_task(_add_to_transmission(entry))
+
+    return JSONResponse({"success": True, "id": entry["id"]})
+
+@app.post("/api/v1/library/rescan")
+async def library_rescan(req: Request):
+    _require_ui_api_key(req)
+
+    jellyfin_ok = False
+    navidrome_ok = False
+
+    try:
+        await _jellyfin_refresh()
+        jellyfin_ok = True if (JELLYFIN_URL and JELLYFIN_API_KEY and httpx) else False
+    except Exception:
+        jellyfin_ok = False
+
+    try:
+        navidrome_ok = await _navidrome_start_scan()
+    except Exception:
+        navidrome_ok = False
+
+    return JSONResponse({
+        "success": True,
+        "jellyfin_triggered": jellyfin_ok,
+        "navidrome_triggered": navidrome_ok,
+    })
+
+@app.get("/api/v1/queue")
+async def get_queue(req: Request):
+    _require_ui_api_key(req)
+
+    async with QUEUE_LOCK:
+        items = [QUEUE[qid] for qid in QUEUE_ORDER if qid in QUEUE]
+        out = []
+        for it in items:
+            out.append({
+                "id": it["id"],
+                "title": it["title"],
+                "download_dir": it.get("download_dir"),
+                "status": it["status"],
+                "progress": it.get("progress", 0),
+                "error": it.get("error"),
+
+                "transmission_state": it.get("transmission_state"),
+                "rate_download_kib": it.get("rate_download_kib"),
+                "rate_upload_kib": it.get("rate_upload_kib"),
+                "eta": it.get("eta"),
+            })
+    return JSONResponse(out)
+
+@app.post("/api/v1/cancel")
+async def cancel_download(req: Request):
+    _require_ui_api_key(req)
+    data = await req.json()
+    qid = (data.get("id") or "").strip()
+    if not qid:
+        raise HTTPException(status_code=400, detail="Missing id")
+
+    async with QUEUE_LOCK:
+        entry = QUEUE.get(qid)
+        if not entry:
+            raise HTTPException(status_code=404, detail="Not found")
+
+    btih = entry.get("btih")
+    tid = entry.get("transmission_id")
+
+    if tid is None and btih:
+        tid = _transmission_find_id_by_btih(btih)
+        if tid is not None:
+            entry["transmission_id"] = tid
+
+    if tid is None:
+        await _queue_update(qid, "failed", error="Cancel failed: cannot find torrent in Transmission")
+        return JSONResponse({"success": False, "message": "Cannot find torrent in Transmission"})
+
+    _transmission_run(["transmission-remote", "localhost", "-t", str(tid), "-S"])
+    cp = _transmission_run(["transmission-remote", "localhost", "-t", str(tid), "-r"])
+    if cp.returncode != 0:
+        await _queue_update(qid, "failed", error=f"Cancel failed: {cp.stdout.strip()[:200]}")
+        return JSONResponse({"success": False, "message": "Cancel failed"})
+
+    await _queue_update(qid, "cancelled")
+    return JSONResponse({"success": True})
+
+@app.post("/api/v1/download/status")
+async def download_status(req: Request):
+    raw = await req.body()
+    _require_nas_signature(req, raw)
+
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    qid = (data.get("id") or "").strip()
+    status = (data.get("status") or "").strip()
+    progress = data.get("progress", None)
+    error = data.get("error", None)
+
+    if not qid or status not in ("queued", "downloading", "completed", "failed"):
+        raise HTTPException(status_code=400, detail="Invalid payload")
+
+    await _queue_update(qid, status=status, progress=progress, error=error)
+    return JSONResponse({"success": True})
+
+from pathlib import Path as _Path
+_UI_DIR = _Path(__file__).resolve().parent / "static"
+app.mount("/", StaticFiles(directory=str(_UI_DIR), html=True), name="ui")
+
+handler = Mangum(app)
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=8009)
+

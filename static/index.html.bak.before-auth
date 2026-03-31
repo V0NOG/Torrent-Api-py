@@ -1,0 +1,276 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+  <title>Torrent API</title>
+  <link rel="stylesheet" href="/app.css" />
+</head>
+<body>
+  <div class="topbar">
+    <div class="wrap">
+      <div class="brand">
+        <div class="logo"></div>
+        <div>
+          <h1>Torrent API</h1>
+          <div class="sub">Local tester UI • stable ingestion + review</div>
+        </div>
+      </div>
+      <div class="actions">
+        <a class="btn" href="/docs" target="_blank" rel="noreferrer">Docs</a>
+        <a class="btn" href="/api/v1/sites" target="_blank" rel="noreferrer">Sites</a>
+      </div>
+    </div>
+  </div>
+
+  <div class="wrap">
+    <div class="grid">
+      <div class="card">
+        <h2 class="title">Search</h2>
+        <p class="hint">Search torrents and queue magnets into Transmission. Review becomes available only when download is truly finished.</p>
+
+        <div class="field">
+          <label class="mini">API Key (required for downloads + queue)</label>
+          <div class="row">
+            <input id="apiKey" type="password" placeholder="API key" autocomplete="off" />
+            <button id="saveKey" type="button" class="btn primary">Save API Key</button>
+          </div>
+        </div>
+
+        <div class="field">
+          <label class="mini">Site</label>
+          <div class="row">
+            <select id="site" class="btn" style="flex:1;"></select>
+            <select id="limit" class="btn" style="width:120px;">
+              <option>5</option>
+              <option selected>10</option>
+              <option>20</option>
+              <option>50</option>
+              <option>100</option>
+            </select>
+          </div>
+          <div class="mini" style="margin-top:8px;color:var(--muted);">
+            Destination type is chosen during <b>Review</b> (Movies / TV / Music / Other).
+          </div>
+        </div>
+
+        <div class="field">
+          <label class="mini">Query</label>
+          <input id="q" placeholder="e.g., ubuntu 24.04 iso" />
+        </div>
+
+        <div class="searchButtonRow">
+          <button id="go" class="btn primary">Search</button>
+        </div>
+
+        <div style="margin-top:12px;" id="status"></div>
+        <div class="results" id="results"></div>
+      </div>
+
+      <div class="stack">
+        <div class="card">
+          <h2 class="title">Download Queue</h2>
+          <p class="hint">Live status from Transmission (auto-refreshes). Review is enabled only when state + percent indicate completion.</p>
+          <div id="queueStatus" class="mini" style="margin-bottom:10px; color: var(--muted);"></div>
+          <div id="queue" class="queue"></div>
+        </div>
+
+        <div class="card">
+          <h2 class="title">Notes</h2>
+          <p class="hint">Moves create destination directories before moving files. Review controls exactly what is kept/deleted.</p>
+
+          <button id="rescanBtn" class="btn" style="width:100%;">Rescan Library (Jellyfin + Navidrome)</button>
+          <div id="rescanHint" class="mini" style="margin-top:8px;color:var(--muted);"></div>
+        </div>
+
+        <div class="card">
+          <h2 class="title">Services</h2>
+          <p class="hint">Internal health checks (server-side). No credentials exposed to the browser.</p>
+          <div id="servicesBox" class="mini" style="color:var(--muted);">Loading…</div>
+
+          <div style="display:flex; gap:10px; margin-top:12px;">
+            <a class="btn" href="http://127.0.0.1:5078" target="_blank" rel="noreferrer">ABB UI</a>
+            <a class="btn" href="http://127.0.0.1:9091/transmission/web/" target="_blank" rel="noreferrer">Transmission</a>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="toastHost" class="toastHost"></div>
+
+  <!-- Review/Move modal -->
+  <div id="reviewModal" class="modal" aria-hidden="true">
+    <div class="box">
+
+      <div id="reviewBusy" class="busyOverlay" style="display:none;">
+        <div class="busyCard">
+          <div class="pill info">WORKING</div>
+          <div id="reviewBusyText" class="mini" style="color:var(--muted); margin-top:8px;">
+            Working…
+          </div>
+        </div>
+      </div>
+
+      <div class="modalHeader">
+        <div>
+          <div class="title" style="margin:0;">Review & Move</div>
+          <div id="reviewSub" class="mini" style="color:var(--muted);"></div>
+        </div>
+        <button id="closeReview" class="btn sm">Close</button>
+      </div>
+
+      <div class="grid2" style="margin-top:12px;">
+        <div>
+          <div class="mini" style="color:var(--muted);margin-bottom:6px;">Destination type</div>
+          <select id="destType" class="btn" style="width:100%;">
+            <option value="movies">Movies (Jellyfin Movies)</option>
+            <option value="tv">TV (Jellyfin TV)</option>
+            <option value="music">Music (Navidrome)</option>
+            <option value="other">Other / Custom</option>
+          </select>
+
+          <div id="customDestRow" style="margin-top:10px; display:none;">
+            <div class="mini" style="color:var(--muted);margin-bottom:6px;">Custom subfolder (under /mnt/media)</div>
+            <input id="customSubfolder" placeholder="e.g., Other/Downloads" />
+            <div class="mini" style="margin-top:6px;color:var(--muted);">
+              This becomes: <span class="mono">/mnt/media/&lt;your path&gt;</span>
+            </div>
+          </div>
+
+          <div style="margin-top:12px;">
+            <div class="mini" style="color:var(--muted);margin-bottom:6px;">Options</div>
+
+            <div class="optStack">
+              <label id="tvAutoSplitRow" class="optRow toggleRow" style="display:none;">
+                <span class="toggle">
+                  <input id="tvAutoSplit" type="checkbox" checked />
+                  <span class="knob" aria-hidden="true"></span>
+                </span>
+                <span class="mini">Auto-split TV seasons into individual Season folders (recommended)</span>
+              </label>
+
+              <label id="musicRunBeetsRow" class="optRow toggleRow" style="display:none;">
+                <span class="toggle">
+                  <input id="musicRunBeets" type="checkbox" checked />
+                  <span class="knob" aria-hidden="true"></span>
+                </span>
+                <span class="mini">For Music: run beets import (recommended)</span>
+              </label>
+
+              <div id="musicLayoutHint" class="mini" style="display:none;color:var(--muted); margin-top:2px;">
+                Suggested layout: <span class="mono">Artist/Album/01 - Track Title.ext</span><br/>
+                If filename parsing fails, files go to <span class="mono">/mnt/media/Music/_incoming</span>
+              </div>
+              <div id="musicMetaBox" class="optRow" style="display:none;">
+                <div class="mini" style="color:var(--muted);font-weight:800;margin-bottom:8px;">Music metadata</div>
+
+                <div class="field" style="margin:0;">
+                  <label class="mini">Mode</label>
+                  <select id="musicKind" class="btn" style="width:100%;">
+                    <option value="music">Music</option>
+                    <option value="audiobook">Audiobook</option>
+                  </select>
+                </div>
+
+                <div id="musicFields" style="margin-top:10px;">
+                  <div class="grid3">
+                    <div>
+                      <div class="mini" style="color:var(--muted);margin-bottom:6px;">Artist</div>
+                      <input id="musicArtist" placeholder="e.g., Daft Punk" />
+                    </div>
+                    <div>
+                      <div class="mini" style="color:var(--muted);margin-bottom:6px;">Album</div>
+                      <input id="musicAlbum" placeholder="e.g., Discovery" />
+                    </div>
+                    <div>
+                      <div class="mini" style="color:var(--muted);margin-bottom:6px;">Year (optional)</div>
+                      <input id="musicYear" placeholder="2001" inputmode="numeric" />
+                    </div>
+                  </div>
+                </div>
+
+                <div id="audiobookFields" style="margin-top:10px; display:none;">
+                  <div class="grid3">
+                    <div>
+                      <div class="mini" style="color:var(--muted);margin-bottom:6px;">Author</div>
+                      <input id="abAuthor" placeholder="e.g., Brandon Sanderson" />
+                    </div>
+                    <div>
+                      <div class="mini" style="color:var(--muted);margin-bottom:6px;">Book Name</div>
+                      <input id="abBook" placeholder="e.g., Mistborn" />
+                    </div>
+                    <div>
+                      <div class="mini" style="color:var(--muted);margin-bottom:6px;">Year (optional)</div>
+                      <input id="abYear" placeholder="2006" inputmode="numeric" />
+                    </div>
+                  </div>
+                </div>
+
+                <div class="mini" style="margin-top:10px;color:var(--muted);">
+                  Music goes to <span class="mono">/mnt/media/Music/Artist/Album (Year)/</span><br/>
+                  Audiobooks go to <span class="mono">/mnt/media/Music/Audiobooks/Author/Book (Year)/</span>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div style="margin-top:12px;">
+            <div class="mini" style="color:var(--muted);margin-bottom:6px;">TMDb Match</div>
+            <select id="matchSelect" class="btn" style="width:100%;"></select>
+            <div class="mini" id="tmdbHint" style="margin-top:6px;color:var(--muted);"></div>
+          </div>
+
+          <div id="nameEditor" style="margin-top:12px;">
+            <div class="mini" style="color:var(--muted);margin-bottom:6px;">Folder name editor</div>
+
+            <div class="grid3">
+              <div>
+                <div class="mini" style="color:var(--muted);margin-bottom:6px;">Title / Show</div>
+                <input id="titleInput" placeholder="Title" />
+              </div>
+              <div id="yearCol">
+                <div class="mini" style="color:var(--muted);margin-bottom:6px;">Year (optional)</div>
+                <input id="yearInput" placeholder="2025" inputmode="numeric" />
+              </div>
+              <div id="seasonCol" style="display:none;">
+                <div class="mini" style="color:var(--muted);margin-bottom:6px;">Season</div>
+                <input id="seasonInput" type="number" min="1" value="1" />
+              </div>
+            </div>
+
+            <div style="margin-top:10px;">
+              <div class="mini" style="color:var(--muted);margin-bottom:6px;">Preview destination</div>
+              <div id="reviewDest" class="mono monoBox"></div>
+            </div>
+          </div>
+        </div>
+
+        <div>
+          <div class="mini" style="color:var(--muted);margin-bottom:6px;">Files</div>
+          <div class="filesBox">
+            <div class="filesHdr">
+              <div class="mini" style="color:var(--muted);">Keep</div>
+              <div class="mini" style="color:var(--muted);">Delete</div>
+            </div>
+            <div class="filesCols">
+              <div id="filesKeep" class="filesList"></div>
+              <div id="filesDelete" class="filesList"></div>
+            </div>
+          </div>
+
+          <div style="margin-top:12px; display:flex; gap:10px; justify-content:flex-end;">
+            <button id="approveMove" class="btn primary">Approve & Move</button>
+          </div>
+          <div class="mini" style="margin-top:8px;color:var(--muted);">
+            Tip: you can toggle any file between Keep/Delete before moving.
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>
+
