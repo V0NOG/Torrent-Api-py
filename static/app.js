@@ -1,10 +1,10 @@
 const API = ""; // same-origin
 
 const SITE_LABELS = {
-  piratebay:     "🏴 Pirate Bay",
-  kickass:       "🥊 KickAss",
+  piratebay:     "Pirate Bay",
+  kickass:       "KickAss",
   glodls:        "Glodls",
-  nyaasi:        "🌸 Nyaa.si",
+  nyaasi:        "Nyaa.si",
   torlock:       "Torlock",
   "1337x":       "1337x",
   torrentgalaxy: "Torrent Galaxy",
@@ -14,7 +14,7 @@ const SITE_LABELS = {
   magnetdl:      "MagnetDL",
   yts:           "YTS",
   limetorrent:   "LimeTorrent",
-  audiobookbay:  "🎧 AudiobookBay",
+  audiobookbay:  "AudiobookBay",
 };
 
 // Sites working from AU (via Tor where needed) — shown first
@@ -860,7 +860,7 @@ function renderTorrentItems(items){
     const retryBtn  = canRetry  ? `<button class="btn sm retryTorrentBtn" data-id="${esc(it.id)}">Retry</button>` : "";
     const canReSearch = _TORRENT_DONE_STATES.has(st) || st === "failed" || st === "cancelled";
     const cleanedTitle = _cleanSearchTitle(title);
-    const reSearchBtn = (canReSearch && cleanedTitle) ? `<button class="btn sm reSearchBtn" data-title="${esc(cleanedTitle)}">Re-search</button>` : "";
+    const reSearchBtn = (canReSearch && cleanedTitle) ? `<button class="btn sm reSearchBtn" data-title="${esc(cleanedTitle)}" title="Re-search metadata" style="padding:6px 8px;"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M1 4v6h6M23 20v-6h-6"/><path d="M20.49 9A9 9 0 0 0 5.64 5.64L1 10m22 4l-4.64 4.36A9 9 0 0 1 3.51 15"/></svg></button>` : "";
     const canRemove = _TORRENT_DONE_STATES.has(st) || st === "failed" || st === "cancelled";
     const removeBtn = canRemove ? `<button class="btn sm removeTorrentBtn" data-id="${esc(it.id)}" title="Remove from queue" style="padding:6px 8px;">&#x2715;</button>` : "";
 
@@ -1107,15 +1107,33 @@ function updateOptionsVisibility(){
 }
 
 async function openReview(id){
+  // Show modal immediately with skeleton placeholders while data loads
+  currentReviewId = id;
+  reviewData = {};
+  _selectedMatchMeta = {};
+  _reviewDirtyFields.clear();
+
+  const _skelHtml = `
+    <div class="skeletonLine" style="width:65%;margin-bottom:10px;"></div>
+    <div class="skeletonLine" style="width:40%;margin-bottom:10px;"></div>
+    <div class="skeletonLine" style="width:80%;"></div>`;
+  const _matchList = $("matchSelect");
+  const _filesHost = $("filesKeep");
+  if(_matchList) _matchList.innerHTML = _skelHtml;
+  if(_filesHost) _filesHost.innerHTML = _skelHtml;
+  const _reviewSub = $("reviewSub");
+  if(_reviewSub) _reviewSub.textContent = "Loading\u2026";
+  showModal("reviewModal", true);
+
   try{
     const res = await apiFetch(`${API}/api/v1/prepare/${encodeURIComponent(id)}`);
     const data = await res.json().catch(()=>({}));
     if(!res.ok || !data?.success){
+      showModal("reviewModal", false);
       toast(data?.detail || `Prepare failed (HTTP ${res.status})`, "bad");
       return;
     }
 
-    currentReviewId = id;
     reviewData = data;
 
     try{
@@ -1228,15 +1246,13 @@ async function detectAndFillMetadata(filename, tvFolderPromise){
   panel.style.display = "flex";
   panel.innerHTML = `<span class="metaDetectBadge low">Detecting metadata\u2026</span>`;
 
-  let meta = null;
-  try{
-    const res = await apiFetch(`${API}/api/v1/detect-metadata`, {
-      method: "POST",
-      headers: {"Content-Type":"application/json"},
-      body: JSON.stringify({ filename }),
-    });
-    if(res.ok) meta = await res.json().catch(() => null);
-  }catch(e){ meta = null; }
+  const metaFetch = apiFetch(`${API}/api/v1/detect-metadata`, {
+    method: "POST",
+    headers: {"Content-Type":"application/json"},
+    body: JSON.stringify({ filename }),
+  }).then(r => r.ok ? r.json().catch(() => null) : null).catch(() => null);
+
+  let [meta, _prefetchedFolder] = await Promise.all([metaFetch, tvFolderPromise || Promise.resolve(null)]);
 
   if(!meta || meta.confidence === "low" || (!meta.title)){
     panel.innerHTML = `<div class="metaDetectInfo"><span class="metaDetectBadge low">Could not detect metadata</span></div>`;
@@ -1321,20 +1337,21 @@ async function detectAndFillMetadata(filename, tvFolderPromise){
 
   // For TV shows: check if a matching folder already exists in /mnt/media/TV
   if(meta.type === "tv" && meta.title){
-    (tvFolderPromise || checkTvFolderExists(meta.title)).then(existingFolder => {
-      if(!existingFolder) return;
+    const existingFolder = _prefetchedFolder ?? await checkTvFolderExists(meta.title);
+    if(existingFolder){
       const info = panel.querySelector(".metaDetectInfo");
-      if(!info) return;
-      const sugg = document.createElement("div");
-      sugg.style.cssText = "margin-top:8px; display:flex; align-items:center; gap:8px; flex-wrap:wrap;";
-      sugg.innerHTML = `<span class="mini" style="color:var(--muted);">Existing: <span class="mono">/mnt/media/TV/${esc(existingFolder)}/</span></span><button class="btn sm" id="useTvFolderBtn">Use this folder</button>`;
-      info.appendChild(sugg);
-      $("useTvFolderBtn")?.addEventListener("click", () => {
-        if($("titleInput")) $("titleInput").value = existingFolder;
-        updateDestPreview && updateDestPreview();
-        toast(`Using: ${existingFolder}`, "ok");
-      });
-    });
+      if(info){
+        const sugg = document.createElement("div");
+        sugg.style.cssText = "margin-top:8px; display:flex; align-items:center; gap:8px; flex-wrap:wrap;";
+        sugg.innerHTML = `<span class="mini" style="color:var(--muted);">Existing: <span class="mono">/mnt/media/TV/${esc(existingFolder)}/</span></span><button class="btn sm" id="useTvFolderBtn">Use this folder</button>`;
+        info.appendChild(sugg);
+        $("useTvFolderBtn")?.addEventListener("click", () => {
+          if($("titleInput")) $("titleInput").value = existingFolder;
+          updateDestPreview && updateDestPreview();
+          toast(`Using: ${existingFolder}`, "ok");
+        });
+      }
+    }
   }
 }
 
@@ -2348,12 +2365,9 @@ window.addEventListener("DOMContentLoaded", () => {
       const id = r.getAttribute("data-id");
       if(id){
         r.disabled = true;
-        r.textContent = "Loading…";
-        const _ov = $("reviewLoadOverlay"); if(_ov) _ov.style.display = "flex";
         openReview(id).finally(() => {
           r.disabled = false;
           r.textContent = "Review";
-          const _ov2 = $("reviewLoadOverlay"); if(_ov2) _ov2.style.display = "none";
         });
       }
       return;
@@ -2416,53 +2430,7 @@ window.addEventListener("DOMContentLoaded", () => {
     }catch(e){ toast("Rescan failed", "bad"); }
   });
 
-  // ── API key save ──
-  // Show Navidrome creds only when AudiobookBay is selected
-  function updateNdCredsVisibility(){
-    const site = $("site")?.value || "";
-    const el = $("ndCredsField");
-    if(el) el.style.display = (site === "audiobookbay") ? "block" : "none";
-  }
-  $("site")?.addEventListener("change", updateNdCredsVisibility);
-  updateNdCredsVisibility(); // run on load
-
-  $("saveNd")?.addEventListener("click", async () => {
-    const u = ($("ndUser")?.value || "").trim();
-    const p = ($("ndPass")?.value || "").trim();
-    const hint = $("ndSaveHint");
-    const btn = $("saveNd");
-
-    if(!u || !p){
-      setNdCreds("", "");
-      if(hint){ hint.innerHTML = `<span style="color:var(--muted);">Cleared</span>`; }
-      return;
-    }
-
-    // Show testing state
-    if(btn) btn.disabled = true;
-    if(hint) hint.innerHTML = `<span style="color:var(--muted);">Testing…</span>`;
-
-    try{
-      const res = await apiFetch(`${API}/api/v1/auth/navidrome-test`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ nd_user: u, nd_pass: p })
-      });
-      const data = await res.json().catch(()=>({}));
-      if(data.ok){
-        setNdCreds(u, p);
-        if(hint) hint.innerHTML = `<span style="color:var(--green);">✓ Connected as ${esc(u)}</span>`;
-      } else {
-        // Don't save bad creds
-        if(hint) hint.innerHTML = `<span style="color:var(--red);">✗ ${esc(data.error || "Invalid credentials")}</span>`;
-      }
-    }catch(e){
-      if(hint) hint.innerHTML = `<span style="color:var(--red);">✗ Could not reach Navidrome</span>`;
-    } finally {
-      if(btn) btn.disabled = false;
-    }
-  });
-  // (API key save is now in Settings > General)
+  // (Navidrome credentials are configured in Settings > Navidrome)
 
   // ── File manager events ──
   $("fmNavUp")?.addEventListener("click", fmNavUp);

@@ -458,6 +458,7 @@ async def _post_webhook(event: str, payload: Dict[str, Any]):
         pass
 
 async def _jellyfin_refresh():
+    """Full Jellyfin library rescan — all libraries. Use for torrent imports and manual rescans."""
     if not JELLYFIN_URL or not JELLYFIN_API_KEY or not httpx:
         return
 
@@ -485,6 +486,78 @@ async def _jellyfin_refresh():
         except Exception:
             pass
         await asyncio.sleep(1.5 * (attempt + 1))
+
+
+_YT_LIBRARY_ID: str | None = None  # cached Jellyfin ItemId for the YouTube virtual folder
+
+
+async def _get_yt_library_id() -> "str | None":
+    """Return the Jellyfin library ItemId whose path matches YOUTUBE_BASE_DIR, cached per process."""
+    global _YT_LIBRARY_ID
+    if _YT_LIBRARY_ID:
+        return _YT_LIBRARY_ID
+    if not JELLYFIN_URL or not JELLYFIN_API_KEY or not httpx:
+        return None
+    try:
+        base = JELLYFIN_URL.rstrip("/")
+        headers = {
+            "X-Emby-Token": JELLYFIN_API_KEY,
+            "X-MediaBrowser-Token": JELLYFIN_API_KEY,
+        }
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            r = await client.get(f"{base}/Library/VirtualFolders", headers=headers)
+            if r.status_code >= 400:
+                return None
+            folders = r.json()
+        yt_path = str(YOUTUBE_BASE_DIR).lower().rstrip("/")
+        for folder in (folders or []):
+            for loc in (folder.get("Locations") or []):
+                if loc.lower().rstrip("/") == yt_path:
+                    lib_id = folder.get("ItemId") or folder.get("Id")
+                    if lib_id:
+                        _YT_LIBRARY_ID = lib_id
+                        logger.info("YouTube Jellyfin library found: id=%s", lib_id)
+                        return _YT_LIBRARY_ID
+    except Exception as e:
+        logger.warning("_get_yt_library_id failed: %s", e)
+    return None
+
+
+async def _jellyfin_refresh_yt():
+    """Rescan only the YouTube Jellyfin library. Falls back to full refresh if library ID unavailable."""
+    if not JELLYFIN_URL or not JELLYFIN_API_KEY or not httpx:
+        return
+
+    library_id = await _get_yt_library_id()
+
+    await asyncio.sleep(4.0)
+
+    base = JELLYFIN_URL.rstrip("/")
+    headers = {
+        "X-Emby-Token": JELLYFIN_API_KEY,
+        "X-MediaBrowser-Token": JELLYFIN_API_KEY,
+    }
+
+    if library_id:
+        for attempt in range(3):
+            try:
+                async with httpx.AsyncClient(timeout=20.0) as client:
+                    r = await client.post(
+                        f"{base}/Items/{library_id}/Refresh",
+                        headers=headers,
+                        params={"Recursive": "true", "ImageRefreshMode": "Default", "MetadataRefreshMode": "Default"},
+                    )
+                    if r.status_code < 400:
+                        logger.info("YouTube Jellyfin library rescanned (id=%s)", library_id)
+                        return
+            except Exception:
+                pass
+            await asyncio.sleep(1.5 * (attempt + 1))
+        logger.warning("_jellyfin_refresh_yt: all attempts failed for id=%s", library_id)
+    else:
+        # Library ID not resolved — fall back to full refresh rather than silently skipping
+        logger.warning("_jellyfin_refresh_yt: YouTube library not found in VirtualFolders; falling back to full refresh")
+        await _jellyfin_refresh()
 
 def _normalise_title(title: str) -> str:
     """Normalise a title for fuzzy library matching."""
@@ -1285,9 +1358,9 @@ async def _yt_file_watcher():
 
                 # Fire Jellyfin scan once the debounce window has passed
                 if _YT_LAST_CHANGE > 0 and (time.time() - _YT_LAST_CHANGE) >= _YT_RESCAN_DEBOUNCE:
-                    logger.info("YouTube watcher: debounce elapsed — triggering Jellyfin library scan")
+                    logger.info("YouTube watcher: debounce elapsed — triggering YouTube Jellyfin library scan")
                     _YT_LAST_CHANGE = 0.0
-                    asyncio.create_task(_jellyfin_refresh())
+                    asyncio.create_task(_jellyfin_refresh_yt())
         except Exception as exc:
             logger.warning("_yt_file_watcher error: %s", exc)
 
@@ -2193,7 +2266,7 @@ async def youtube_download(req: Request):
                 async with _YT_QUEUE_LOCK:
                     entry["status"] = "done"
                 if jellyfin_rescan:
-                    asyncio.create_task(_jellyfin_refresh())
+                    asyncio.create_task(_jellyfin_refresh_yt())
             else:
                 err = (stderr.decode(errors="replace") or "")[-400:].strip()
                 async with _YT_QUEUE_LOCK:
