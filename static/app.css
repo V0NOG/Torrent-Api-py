@@ -679,6 +679,13 @@ html[data-theme="light"] .approveRow{ background:rgba(242,242,247,.97); }
   .fmName{ white-space:normal; word-break:break-word; overflow:visible; text-overflow:unset; }
   .queueTitle{ white-space:normal; overflow:visible; text-overflow:unset; }
   .fmGrid{ grid-template-columns:repeat(auto-fill,minmax(90px,1fr)); }
+  /* Review modal: tighten outer padding on tablets */
+  .modal{ padding:8px; padding-top:calc(env(safe-area-inset-top, 0px) + 56px + 8px); }
+  .modal .box{ padding:14px; margin:8px auto; border-radius:16px; }
+  /* Review modal dest-type segmented control: wrap on tablet */
+  #reviewModal #destTypeControl{ flex-wrap:wrap; border-radius:14px; }
+  /* Queue items: ensure action buttons wrap cleanly */
+  .queueMeta{ flex-wrap:wrap; gap:6px; }
 }
 
 @media(max-width:600px){
@@ -694,6 +701,18 @@ html[data-theme="light"] .approveRow{ background:rgba(242,242,247,.97); }
   .queueMeta{ flex-wrap:wrap; gap:4px; }
   .queueMeta .pill{ font-size:10px; padding:2px 5px; }
   #musicQueueHost .queueMeta .btn.sm{ padding:3px 6px; font-size:10px; }
+  /* Review modal: tighter padding on phones */
+  .modal{ padding:4px; padding-top:calc(env(safe-area-inset-top, 0px) + 52px + 4px); }
+  .modal .box{ padding:12px; margin:4px auto; border-radius:14px; max-height:calc(100vh - 8px); }
+  /* Approve button: full-width on phone so it's easy to tap */
+  .approveRow{ justify-content:stretch; }
+  .approveRow .btn{ flex:1; justify-content:center; min-height:44px; font-size:14px; }
+  /* Queue filter bar: stack controls vertically on phone */
+  .queueFilterControls{ flex-direction:column; align-items:stretch; gap:8px; }
+  .queueFilterBar .segControl{ width:100%; }
+  /* Re-search label: hide text on small screens to save space, icon is enough */
+  /* (but keep visible at ≥600px so it's not confused with Retry) */
+  .reSearchLabel{ display:none; }
 }
 
 @media(max-width:480px){
@@ -703,6 +722,17 @@ html[data-theme="light"] .approveRow{ background:rgba(242,242,247,.97); }
   .btn{ padding:5px 8px; font-size:11px; }
   .segBtn{ padding:4px 8px; font-size:11px; }
   .ytThumbPlaceholder{ display:none; }
+  /* Review modal: music metadata grid goes to 2-col then 1-col at 380px */
+  #reviewModal .grid3{ grid-template-columns:1fr 1fr; }
+  /* Rename form inputs: stack vertically on very small screens */
+  .musicRenameForm .row{ flex-direction:column; }
+  /* Queue action buttons: min tap target */
+  .queueMeta .btn.sm{ min-height:36px; padding:4px 8px; }
+}
+
+@media(max-width:380px){
+  /* Very small phones: single-column everything in review modal */
+  #reviewModal .grid3{ grid-template-columns:1fr; }
 }
 
 /* ── Music queue drag reorder ── */

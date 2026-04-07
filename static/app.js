@@ -860,7 +860,9 @@ function renderTorrentItems(items){
     const retryBtn  = canRetry  ? `<button class="btn sm retryTorrentBtn" data-id="${esc(it.id)}">Retry</button>` : "";
     const canReSearch = _TORRENT_DONE_STATES.has(st) || st === "failed" || st === "cancelled";
     const cleanedTitle = _cleanSearchTitle(title);
-    const reSearchBtn = (canReSearch && cleanedTitle) ? `<button class="btn sm reSearchBtn" data-title="${esc(cleanedTitle)}" title="Re-search metadata" style="padding:6px 8px;"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M1 4v6h6M23 20v-6h-6"/><path d="M20.49 9A9 9 0 0 0 5.64 5.64L1 10m22 4l-4.64 4.36A9 9 0 0 1 3.51 15"/></svg></button>` : "";
+    // Re-search button is intentionally labeled "Re-search" (not just an icon) so it's
+    // visually distinct from the "Retry" button on mobile where tooltips don't work.
+    const reSearchBtn = (canReSearch && cleanedTitle) ? `<button class="btn sm reSearchBtn" data-title="${esc(cleanedTitle)}" title="Re-search metadata" style="padding:6px 8px; gap:4px;"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M1 4v6h6M23 20v-6h-6"/><path d="M20.49 9A9 9 0 0 0 5.64 5.64L1 10m22 4l-4.64 4.36A9 9 0 0 1 3.51 15"/></svg><span class="reSearchLabel">Re-search</span></button>` : "";
     const canRemove = _TORRENT_DONE_STATES.has(st) || st === "failed" || st === "cancelled";
     const removeBtn = canRemove ? `<button class="btn sm removeTorrentBtn" data-id="${esc(it.id)}" title="Remove from queue" style="padding:6px 8px;">&#x2715;</button>` : "";
 
@@ -1597,7 +1599,8 @@ function startQueuePolling(){
   loadNowPlaying();
   setInterval(loadQueueOnce, 5000);
   setInterval(loadMusicQueueOnce, 6000);
-  setInterval(loadYtQueue, 5000);
+  // loadYtQueue is a stub (just clears the host element) — removed its interval.
+  // loadYtQueueForQueueTab is the real YouTube queue fetcher for the Queue tab.
   setInterval(loadYtQueueForQueueTab, 7000);
   setInterval(loadNowPlaying, 10000);
 }
@@ -2714,13 +2717,14 @@ window.addEventListener("DOMContentLoaded", () => {
     const form = document.createElement("div");
     form.className = "musicRenameForm";
     form.innerHTML = `
+      <div class="mini" style="color:var(--muted); margin-bottom:6px;">Edit title before adding (optional)</div>
       <div class="row" style="gap:8px;">
         <input class="musicRenameArtist" placeholder="Artist" value="${esc(preArtist)}" />
         <input class="musicRenameTitle" placeholder="Song title" value="${esc(preTitle)}" />
       </div>
-      <div style="display:flex; gap:8px; margin-top:6px;">
-        <button class="btn primary sm musicRenameConfirm" data-url="${esc(url)}" data-force="${force ? "1" : "0"}">${force ? "Force Request" : "Request"}</button>
-        <button class="btn sm musicRenameSkip" data-url="${esc(url)}">Skip / use original</button>
+      <div style="display:flex; gap:8px; margin-top:6px; flex-wrap:wrap;">
+        <button class="btn primary sm musicRenameConfirm" data-url="${esc(url)}" data-force="${force ? "1" : "0"}">${force ? "Force Add" : "Confirm & Add"}</button>
+        <button class="btn sm musicRenameSkip" data-url="${esc(url)}">Add original</button>
       </div>`;
     track.appendChild(form);
     form.querySelector(".musicRenameArtist")?.focus();

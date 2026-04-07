@@ -411,6 +411,15 @@ def _guess_category_from_files(raw_title: str, files: List[Dict[str, Any]]) -> s
     if len(audio) >= 2 and len(video) == 0:
         return "music"
 
+    # Title-based audio fallback: catches single-file .m4b torrents where the torrent name
+    # IS the filename (e.g. "My Audiobook.m4b") and the staging dir may lack a file list,
+    # or audiobook keyword appears in the torrent title (e.g. "Unabridged Audiobook").
+    _title_low = (raw_title or "").lower()
+    if re.search(r"\.m4b(\s|$)", _title_low):
+        return "music"
+    if re.search(r"\b(audiobook|audio\s*book|unabridged)\b", _title_low, re.I):
+        return "music"
+
     if len(video) >= 1:
         try:
             biggest = max([int(v.get("size") or 0) for v in video] or [0])
