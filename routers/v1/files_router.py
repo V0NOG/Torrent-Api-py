@@ -10,10 +10,12 @@ Security guarantees:
 - Admin can access ADMIN_FILE_ROOTS; normal users only USER_MEDIA_ROOT/<username>/
 - No filesystem paths outside allowed roots are ever returned or accepted
 """
+import asyncio
 import os
 import re
 import shutil
 import logging
+import time
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 
@@ -49,6 +51,30 @@ if not ADMIN_FILE_ROOTS:
 _FORBIDDEN_IN_NAME = re.compile(r'[\/\\:\*\?"<>\|\x00-\x1F\x7F]')
 # Extra names to block outright
 _BLOCKED_NAMES = {".", "..", ".git", ".env", "passwd", "shadow"}
+
+# ── Directory size cache (10-minute TTL, top-level only) ────────────────────
+_dir_size_cache: Dict[str, Any] = {}  # path_str -> {"size": int, "ts": float}
+_DIR_SIZE_TTL = 600
+
+async def _dir_size_bytes(path: Path) -> Optional[int]:
+    """Return total bytes used by a directory via du -sb. Returns None on error."""
+    key = str(path)
+    now = time.time()
+    cached = _dir_size_cache.get(key)
+    if cached and (now - cached["ts"]) < _DIR_SIZE_TTL:
+        return cached["size"]
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "du", "-sb", str(path),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=15)
+        size = int(stdout.split()[0])
+        _dir_size_cache[key] = {"size": size, "ts": now}
+        return size
+    except Exception:
+        return None
 
 
 # ── Path safety helpers ──────────────────────────────────────────────────────
@@ -244,6 +270,18 @@ async def list_directory(req: Request, root: str = "", path: str = ""):
     except Exception:
         rel_to_root = ""
 
+    # At top level only: compute directory sizes via du (cached 10 min)
+    if rel_to_root == "":
+        dir_entries = [e for e in entries if e.get("is_dir")]
+        if dir_entries:
+            sizes = await asyncio.gather(
+                *[_dir_size_bytes(root_path / e["name"]) for e in dir_entries],
+                return_exceptions=True,
+            )
+            for entry, sz in zip(dir_entries, sizes):
+                if isinstance(sz, int):
+                    entry["size"] = sz
+
     return JSONResponse({
         "root_key": root_path.name,
         "current_path": rel_to_root,
@@ -412,10 +450,11 @@ async def search_files(req: Request, root: str = "", path: str = "", query: str 
     do_recursive = recursive.lower() not in ("false", "0", "no")
     q = query.strip().lower()
     entries = []
-    MAX_RESULTS = 200
+    MAX_RESULTS = 50
+    _deadline = time.monotonic() + 10.0  # 10-second hard stop
 
     def _walk(directory: Path):
-        if len(entries) >= MAX_RESULTS:
+        if len(entries) >= MAX_RESULTS or time.monotonic() > _deadline:
             return
         try:
             for child in sorted(directory.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower())):
@@ -436,7 +475,7 @@ async def search_files(req: Request, root: str = "", path: str = "", query: str 
                         })
                     except Exception:
                         pass
-                if do_recursive and child.is_dir() and len(entries) < MAX_RESULTS:
+                if do_recursive and child.is_dir() and len(entries) < MAX_RESULTS and time.monotonic() <= _deadline:
                     _walk(child)
         except PermissionError:
             pass
@@ -444,6 +483,84 @@ async def search_files(req: Request, root: str = "", path: str = "", query: str 
     _walk(search_base)
 
     return JSONResponse({"entries": entries, "query": query, "truncated": len(entries) >= MAX_RESULTS})
+
+
+@router.post("/delete-batch")
+async def delete_batch(req: Request):
+    """
+    Delete multiple files/directories in one request.
+    Body: { "root": str, "items": [{ "path": str, "is_dir": bool, "recursive": bool }] }
+    Returns: { "deleted": int, "failed": [{ "path": str, "error": str }] }
+    """
+    claims = require_auth(req)
+    allowed_roots = _get_allowed_roots(claims)
+
+    try:
+        body = await req.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    root_key = (body.get("root") or "").strip()
+    items = body.get("items") or []
+
+    if not isinstance(items, list) or not items:
+        raise HTTPException(status_code=400, detail="items list required")
+    if len(items) > 200:
+        raise HTTPException(status_code=400, detail="Too many items (max 200)")
+
+    # Find root
+    root_path = None
+    for r in allowed_roots:
+        if r.name == root_key or str(r) == root_key:
+            root_path = r
+            break
+    if root_path is None and len(allowed_roots) == 1:
+        root_path = allowed_roots[0]
+    if root_path is None:
+        raise HTTPException(status_code=403, detail="Root not allowed")
+
+    username = claims.get("sub", "unknown")
+    deleted = 0
+    failed = []
+
+    for item in items:
+        rel_path = (item.get("path") or "").strip()
+        is_dir = bool(item.get("is_dir", False))
+        recursive = bool(item.get("recursive", False))
+
+        if not rel_path:
+            continue
+        try:
+            target = _resolve_safe(root_path, rel_path)
+            if not target.exists():
+                continue
+            if target.resolve() == root_path.resolve():
+                failed.append({"path": rel_path, "error": "Cannot delete root"})
+                continue
+
+            logger.info(
+                "BATCH-DELETE | user=%s role=%s recursive=%s | %s",
+                username, claims.get("role"), recursive, target
+            )
+
+            if target.is_dir():
+                if recursive:
+                    shutil.rmtree(str(target))
+                else:
+                    target.rmdir()
+            else:
+                target.unlink()
+            deleted += 1
+        except OSError as e:
+            err = str(e)
+            logger.error("BATCH-DELETE FAILED | user=%s | %s | %s", username, rel_path, e)
+            failed.append({"path": rel_path, "error": err[:120]})
+        except HTTPException as e:
+            failed.append({"path": rel_path, "error": e.detail})
+        except Exception as e:
+            failed.append({"path": rel_path, "error": type(e).__name__})
+
+    return JSONResponse({"deleted": deleted, "failed": failed})
 
 
 @router.post("/mkdir")

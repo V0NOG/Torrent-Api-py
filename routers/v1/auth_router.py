@@ -1,8 +1,11 @@
 """
-Auth router: login, logout, /me
-POST /api/v1/auth/login   -> issues JWT
-GET  /api/v1/auth/me      -> returns current user info (from JWT)
-POST /api/v1/auth/logout  -> client-side only (JWT is stateless; just acknowledge)
+Auth router: login, logout, /me, and Navidrome credential linking.
+POST /api/v1/auth/login             -> issues JWT
+GET  /api/v1/auth/me                -> returns current user info (from JWT)
+POST /api/v1/auth/logout            -> client-side only (JWT is stateless; just acknowledge)
+POST /api/v1/auth/navidrome/link    -> validate + store Navidrome credentials for this user
+GET  /api/v1/auth/navidrome/status  -> whether this user has linked Navidrome credentials
+DELETE /api/v1/auth/navidrome/link  -> remove stored Navidrome credentials
 """
 import logging
 from fastapi import APIRouter, Request, HTTPException
@@ -10,6 +13,7 @@ from fastapi.responses import JSONResponse
 
 from auth.jellyfin_auth import authenticate_jellyfin
 from auth.jwt_handler import create_token, verify_token
+from auth.navidrome_store import link as nav_link, is_linked, unlink as nav_unlink
 
 logger = logging.getLogger("auth_router")
 router = APIRouter()
@@ -116,3 +120,66 @@ async def logout(req: Request):
     This endpoint just acknowledges the request cleanly.
     """
     return JSONResponse({"success": True, "message": "Logged out"})
+
+
+@router.post("/navidrome/link")
+async def navidrome_link(req: Request):
+    """
+    Validate and store Navidrome credentials for the authenticated user.
+    Body: { "nav_user": str, "nav_pass": str }
+    Credentials are validated against the Navidrome Subsonic ping endpoint
+    before being written to disk.
+    """
+    claims = require_auth(req)
+    jellyfin_id = claims.get("jellyfin_id") or ""
+    if not jellyfin_id:
+        raise HTTPException(status_code=400, detail="JWT missing jellyfin_id claim")
+
+    try:
+        body = await req.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    nav_user = (body.get("nav_user") or "").strip()
+    nav_pass = (body.get("nav_pass") or "").strip()
+
+    if not nav_user or not nav_pass:
+        raise HTTPException(status_code=400, detail="nav_user and nav_pass required")
+    if len(nav_user) > 128 or len(nav_pass) > 512:
+        raise HTTPException(status_code=400, detail="Input too long")
+
+    try:
+        ok = await nav_link(jellyfin_id, nav_user, nav_pass)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    if not ok:
+        raise HTTPException(status_code=401, detail="Invalid Navidrome credentials")
+
+    logger.info("Navidrome linked for jellyfin_id=%s nav_user=%s", jellyfin_id, nav_user)
+    return JSONResponse({"success": True, "nav_user": nav_user})
+
+
+@router.get("/navidrome/status")
+async def navidrome_status(req: Request):
+    """Return whether the authenticated user has linked Navidrome credentials."""
+    claims = require_auth(req)
+    jellyfin_id = claims.get("jellyfin_id") or ""
+    if not jellyfin_id:
+        raise HTTPException(status_code=400, detail="JWT missing jellyfin_id claim")
+
+    linked = is_linked(jellyfin_id)
+    return JSONResponse({"linked": linked})
+
+
+@router.delete("/navidrome/link")
+async def navidrome_unlink(req: Request):
+    """Remove stored Navidrome credentials for the authenticated user."""
+    claims = require_auth(req)
+    jellyfin_id = claims.get("jellyfin_id") or ""
+    if not jellyfin_id:
+        raise HTTPException(status_code=400, detail="JWT missing jellyfin_id claim")
+
+    nav_unlink(jellyfin_id)
+    logger.info("Navidrome unlinked for jellyfin_id=%s", jellyfin_id)
+    return JSONResponse({"success": True})

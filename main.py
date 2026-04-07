@@ -31,9 +31,16 @@ from routers.home_router import router as home_router
 from routers.v1.search_url_router import router as search_url_router
 
 # ── NEW: auth + file manager routers ────────────────────────────────────────
-from routers.v1.auth_router import router as auth_router
+from routers.v1.auth_router import router as auth_router, require_auth
 from routers.v1.files_router import router as files_router
+from auth.navidrome_store import USER_DATA_DIR
 # ────────────────────────────────────────────────────────────────────────────
+
+# ── Music routers ────────────────────────────────────────────────────────────
+from routers.v1.music.search_router   import router as music_search_router
+from routers.v1.music.requests_router import router as music_requests_router
+from routers.v1.music.queue_router    import router as music_queue_router
+# ─────────────────────────────────────────────────────────────────────────────
 
 from helper.uptime import getUptime
 from helper.dependencies import authenticate_request
@@ -98,10 +105,15 @@ JELLYFIN_URL = (os.getenv("JELLYFIN_URL", "") or "").strip()
 JELLYFIN_API_KEY = (os.getenv("JELLYFIN_API_KEY", "") or "").strip()
 WEBHOOK_URL = (os.getenv("WEBHOOK_URL", "") or "").strip()
 
+# TMDB_API_KEY — get from themoviedb.org, add to systemd service:
+#   sudo systemctl edit torrent-api-py.service
+#   Add: Environment="TMDB_API_KEY=8bf2895bab3cea75349692b62a59cdf8"
 TMDB_API_KEY = (os.getenv("TMDB_API_KEY", "") or "").strip()
 TMDB_LANGUAGE = (os.getenv("TMDB_LANGUAGE", "en-AU") or "en-AU").strip()
 TMDB_REGION = (os.getenv("TMDB_REGION", "AU") or "AU").strip()
 TMDB_BASE = "https://api.themoviedb.org/3"
+
+YTDLP_COOKIES_FILE = (os.getenv("YTDLP_COOKIES_FILE", "") or "").strip()
 
 ABB_COOKIE = (os.getenv("ABB_COOKIE", "") or "").strip()
 ABB_USERNAME = (os.getenv("ABB_USERNAME", "") or "").strip()
@@ -117,6 +129,19 @@ BEETS_IMPORT_CMD = (os.getenv("BEETS_IMPORT_CMD", "") or "").strip()
 # ── NEW: user media root ─────────────────────────────────────────────────────
 USER_MEDIA_ROOT = Path(os.getenv("USER_MEDIA_ROOT", "/mnt/media/Users"))
 # ────────────────────────────────────────────────────────────────────────────
+
+# ── Music request worker (read by helper/music_utils.py via env vars) ────────
+# These are declared here for documentation; the actual reads happen in
+# helper/music_utils.py so the music routers can import them directly.
+#   MUSICREQ_BASE_DIR      — base dir for the music worker (default /home/von/music-requests)
+#   MUSICREQ_INBOX         — inbox dir (default <BASE_DIR>/inbox)
+#   MUSICREQ_STATUS_DIR    — status dir (default <BASE_DIR>/status)
+#   MUSICREQ_BEETS_DIR     — beets library dir for disk-usage reporting
+#   MUSICREQ_YTDLP         — path to yt-dlp binary
+#   MUSICREQ_DENO          — path to deno binary
+#   MUSICREQ_SEARCH_CACHE_TTL — seconds to cache yt-dlp search results (default 45)
+#   MUSICREQ_HOST_MUSIC_ROOT  — music library root for per-user folders (default /mnt/media/Music)
+# ─────────────────────────────────────────────────────────────────────────────
 
 _FORBIDDEN_CHARS_RE = re.compile(r'[\/\\:\*\?"<>\|\x00-\x1F\x7F]')
 
@@ -433,6 +458,7 @@ async def _post_webhook(event: str, payload: Dict[str, Any]):
         pass
 
 async def _jellyfin_refresh():
+    """Full Jellyfin library rescan — all libraries. Use for torrent imports and manual rescans."""
     if not JELLYFIN_URL or not JELLYFIN_API_KEY or not httpx:
         return
 
@@ -461,6 +487,129 @@ async def _jellyfin_refresh():
             pass
         await asyncio.sleep(1.5 * (attempt + 1))
 
+
+_YT_LIBRARY_ID: str | None = None  # cached Jellyfin ItemId for the YouTube virtual folder
+
+
+async def _get_yt_library_id() -> "str | None":
+    """Return the Jellyfin library ItemId whose path matches YOUTUBE_BASE_DIR, cached per process."""
+    global _YT_LIBRARY_ID
+    if _YT_LIBRARY_ID:
+        return _YT_LIBRARY_ID
+    if not JELLYFIN_URL or not JELLYFIN_API_KEY or not httpx:
+        return None
+    try:
+        base = JELLYFIN_URL.rstrip("/")
+        headers = {
+            "X-Emby-Token": JELLYFIN_API_KEY,
+            "X-MediaBrowser-Token": JELLYFIN_API_KEY,
+        }
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            r = await client.get(f"{base}/Library/VirtualFolders", headers=headers)
+            if r.status_code >= 400:
+                return None
+            folders = r.json()
+        yt_path = str(YOUTUBE_BASE_DIR).lower().rstrip("/")
+        for folder in (folders or []):
+            for loc in (folder.get("Locations") or []):
+                if loc.lower().rstrip("/") == yt_path:
+                    lib_id = folder.get("ItemId") or folder.get("Id")
+                    if lib_id:
+                        _YT_LIBRARY_ID = lib_id
+                        logger.info("YouTube Jellyfin library found: id=%s", lib_id)
+                        return _YT_LIBRARY_ID
+    except Exception as e:
+        logger.warning("_get_yt_library_id failed: %s", e)
+    return None
+
+
+async def _jellyfin_refresh_yt():
+    """Rescan only the YouTube Jellyfin library. Falls back to full refresh if library ID unavailable."""
+    if not JELLYFIN_URL or not JELLYFIN_API_KEY or not httpx:
+        return
+
+    library_id = await _get_yt_library_id()
+
+    await asyncio.sleep(4.0)
+
+    base = JELLYFIN_URL.rstrip("/")
+    headers = {
+        "X-Emby-Token": JELLYFIN_API_KEY,
+        "X-MediaBrowser-Token": JELLYFIN_API_KEY,
+    }
+
+    if library_id:
+        for attempt in range(3):
+            try:
+                async with httpx.AsyncClient(timeout=20.0) as client:
+                    r = await client.post(
+                        f"{base}/Items/{library_id}/Refresh",
+                        headers=headers,
+                        params={"Recursive": "true", "ImageRefreshMode": "Default", "MetadataRefreshMode": "Default"},
+                    )
+                    if r.status_code < 400:
+                        logger.info("YouTube Jellyfin library rescanned (id=%s)", library_id)
+                        return
+            except Exception:
+                pass
+            await asyncio.sleep(1.5 * (attempt + 1))
+        logger.warning("_jellyfin_refresh_yt: all attempts failed for id=%s", library_id)
+    else:
+        # Library ID not resolved — fall back to full refresh rather than silently skipping
+        logger.warning("_jellyfin_refresh_yt: YouTube library not found in VirtualFolders; falling back to full refresh")
+        await _jellyfin_refresh()
+
+def _normalise_title(title: str) -> str:
+    """Normalise a title for fuzzy library matching."""
+    t = (title or "").lower().strip()
+    t = re.sub(r"[^a-z0-9 ]", " ", t)      # convert dots/special chars to spaces first
+    t = re.sub(r"^(the|a|an)\s+", "", t)   # now article strip works on space-separated words
+    t = re.sub(r"\s{2,}", " ", t).strip()
+    return t
+
+
+async def _refresh_jellyfin_library():
+    """Fetch all Jellyfin movies/shows and rebuild the in-memory title cache."""
+    global _JELLYFIN_LIBRARY, _JELLYFIN_LIBRARY_LAST_FETCH
+    if not JELLYFIN_URL or not JELLYFIN_API_KEY or not httpx:
+        return
+    try:
+        base = JELLYFIN_URL.rstrip("/")
+        params = {
+            "api_key": JELLYFIN_API_KEY,
+            "Recursive": "true",
+            "IncludeItemTypes": "Movie,Series,Episode,Season",
+            "Fields": "Name,OriginalTitle,ProductionYear",
+            "Limit": "5000",
+        }
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            r = await client.get(f"{base}/Items", params=params)
+            if r.status_code >= 400:
+                logger.warning("Jellyfin library fetch failed: HTTP %s", r.status_code)
+                return
+            data = r.json()
+        items = data.get("Items") or []
+        new_set: set = set()
+        for item in items:
+            name = item.get("Name") or ""
+            year = item.get("ProductionYear")
+            orig = item.get("OriginalTitle") or ""
+            if name:
+                new_set.add(_normalise_title(name))
+                if year:
+                    new_set.add(_normalise_title(f"{name} {year}"))
+            if orig and orig != name:
+                new_set.add(_normalise_title(orig))
+                if year:
+                    new_set.add(_normalise_title(f"{orig} {year}"))
+        async with _JELLYFIN_LIBRARY_LOCK:
+            _JELLYFIN_LIBRARY = new_set
+            _JELLYFIN_LIBRARY_LAST_FETCH = time.time()
+        logger.info("Jellyfin library cache updated: %d titles", len(new_set))
+    except Exception as e:
+        logger.warning("_refresh_jellyfin_library failed: %s", e)
+
+
 def _navidrome_auth_params() -> Optional[Dict[str, str]]:
     if not NAVIDROME_URL or not NAVIDROME_USER or not NAVIDROME_PASSWORD:
         return None
@@ -480,6 +629,12 @@ QUEUE_ORDER: List[str] = []
 RATE_BUCKET: Dict[str, List[float]] = {}
 QUEUE_LOCK = asyncio.Lock()
 RATE_LOCK = asyncio.Lock()
+
+# ── Jellyfin library cache ────────────────────────────────────────────────────
+_JELLYFIN_LIBRARY: set = set()          # normalised titles
+_JELLYFIN_LIBRARY_LOCK = asyncio.Lock()
+_JELLYFIN_LIBRARY_LAST_FETCH: float = 0.0
+# ─────────────────────────────────────────────────────────────────────────────
 
 QUEUE_PERSIST_FILE = Path(os.getenv("QUEUE_PERSIST_FILE", "/home/von/Torrent-Api-py/queue_state.json"))
 
@@ -1166,6 +1321,53 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ─── YouTube file watcher ─────────────────────────────────────────────────────
+_YT_KNOWN_FILES: set = set()
+_YT_LAST_CHANGE: float = 0.0
+_YT_RESCAN_DEBOUNCE = 30.0  # seconds to wait after last new file before scanning
+
+async def _yt_file_watcher():
+    """
+    Poll YOUTUBE_BASE_DIR every 30s for new video files.
+    When new files appear, start a 30-second debounce timer.
+    After timer expires (no further new files), trigger Jellyfin library scan.
+    """
+    global _YT_KNOWN_FILES, _YT_LAST_CHANGE
+    _WATCH_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".m4v", ".wmv"}
+    _first_run = True
+
+    while True:
+        try:
+            if YOUTUBE_BASE_DIR.exists():
+                current: set = set()
+                for p in YOUTUBE_BASE_DIR.rglob("*"):
+                    if p.is_file() and p.suffix.lower() in _WATCH_EXTS:
+                        current.add(str(p))
+
+                new_files = current - _YT_KNOWN_FILES
+                if new_files and not _first_run:
+                    _YT_LAST_CHANGE = time.time()
+                    logger.info(
+                        "YouTube watcher: %d new file(s) detected: %s",
+                        len(new_files),
+                        ", ".join(Path(f).name for f in list(new_files)[:3]),
+                    )
+
+                _YT_KNOWN_FILES = current
+                _first_run = False
+
+                # Fire Jellyfin scan once the debounce window has passed
+                if _YT_LAST_CHANGE > 0 and (time.time() - _YT_LAST_CHANGE) >= _YT_RESCAN_DEBOUNCE:
+                    logger.info("YouTube watcher: debounce elapsed — triggering YouTube Jellyfin library scan")
+                    _YT_LAST_CHANGE = 0.0
+                    asyncio.create_task(_jellyfin_refresh_yt())
+        except Exception as exc:
+            logger.warning("_yt_file_watcher error: %s", exc)
+
+        await asyncio.sleep(30)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
 @app.on_event("startup")
 async def _startup():
     STAGING_BASE_DIR.mkdir(parents=True, exist_ok=True)
@@ -1175,6 +1377,14 @@ async def _startup():
     except Exception as e:
         logger.warning("Could not create USER_MEDIA_ROOT %s: %s", USER_MEDIA_ROOT, e)
     asyncio.create_task(_queue_poller())
+    asyncio.create_task(_refresh_jellyfin_library())
+    asyncio.create_task(_yt_file_watcher())
+
+    async def _library_refresh_loop():
+        while True:
+            await asyncio.sleep(3600)
+            await _refresh_jellyfin_library()
+    asyncio.create_task(_library_refresh_loop())
 
 @app.get("/health")
 async def health_route(req: Request):
@@ -1728,6 +1938,12 @@ app.include_router(auth_router, prefix="/api/v1/auth")
 app.include_router(files_router, prefix="/api/v1/files")
 # ────────────────────────────────────────────────────────────────────────────
 
+# ── Music routers (Jellyfin JWT auth, no separate dependency wrapper needed) ─
+app.include_router(music_search_router,   prefix="/api/v1/music")
+app.include_router(music_requests_router, prefix="/api/v1/music")
+app.include_router(music_queue_router,    prefix="/api/v1/music")
+# ─────────────────────────────────────────────────────────────────────────────
+
 @app.post("/api/v1/download")
 async def trigger_download(req: Request):
     _require_ui_api_key(req)
@@ -1865,8 +2081,74 @@ async def get_queue(req: Request):
                 "rate_download_kib": it.get("rate_download_kib"),
                 "rate_upload_kib": it.get("rate_upload_kib"),
                 "eta": it.get("eta"),
+                "created_at": it.get("created_at"),
+                "updated_at": it.get("updated_at"),
             })
     return JSONResponse(out)
+
+
+@app.post("/api/v1/queue/remove")
+async def remove_from_queue(req: Request):
+    """Remove a terminal-state item from the queue (completed/imported/failed/cancelled/ready)."""
+    _require_ui_api_key(req)
+    data = await req.json()
+    qid = (data.get("id") or "").strip()
+    if not qid:
+        raise HTTPException(status_code=400, detail="Missing id")
+
+    async with QUEUE_LOCK:
+        entry = QUEUE.get(qid)
+        if not entry:
+            raise HTTPException(status_code=404, detail="Not found")
+        status = entry.get("status", "")
+        if status not in ("completed", "imported", "failed", "cancelled", "ready"):
+            raise HTTPException(status_code=409, detail=f"Cannot remove item with status '{status}'")
+        btih = entry.get("btih")
+        if btih:
+            BTIH_INDEX.pop(btih, None)
+        QUEUE.pop(qid, None)
+        if qid in QUEUE_ORDER:
+            QUEUE_ORDER.remove(qid)
+
+    _queue_save_sync()
+    return JSONResponse({"success": True})
+
+
+@app.post("/api/v1/queue/retry")
+async def retry_queue_item(req: Request):
+    """Re-add a failed or cancelled torrent back to Transmission."""
+    _require_ui_api_key(req)
+    data = await req.json()
+    qid = (data.get("id") or "").strip()
+    if not qid:
+        raise HTTPException(status_code=400, detail="Missing id")
+
+    async with QUEUE_LOCK:
+        entry = QUEUE.get(qid)
+        if not entry:
+            raise HTTPException(status_code=404, detail="Not found")
+        status = entry.get("status", "")
+        if status not in ("failed", "cancelled"):
+            raise HTTPException(status_code=409, detail=f"Can only retry failed or cancelled items (current: {status})")
+        if not entry.get("magnet"):
+            raise HTTPException(status_code=409, detail="No magnet link stored — cannot retry")
+        entry["status"] = "queued"
+        entry["error"] = None
+        entry["progress"] = 0
+        entry["transmission_id"] = None
+        entry["transmission_state"] = None
+        entry["rate_download_kib"] = None
+        entry["rate_upload_kib"] = None
+        entry["eta"] = None
+        entry["updated_at"] = int(_now())
+        # Re-add btih to index so dedup works again
+        btih = entry.get("btih")
+        if btih:
+            BTIH_INDEX[btih] = qid
+
+    _queue_save_sync()
+    asyncio.create_task(_add_to_transmission(entry))
+    return JSONResponse({"success": True})
 
 @app.post("/api/v1/cancel")
 async def cancel_download(req: Request):
@@ -1922,6 +2204,764 @@ async def download_status(req: Request):
 
     await _queue_update(qid, status=status, progress=progress, error=error)
     return JSONResponse({"success": True})
+
+# ── YouTube → Jellyfin download ──────────────────────────────────────────────
+_YT_QUEUE: List[Dict[str, Any]] = []
+_YT_QUEUE_LOCK = asyncio.Lock()
+
+YOUTUBE_BASE_DIR = Path(os.getenv("YOUTUBE_BASE_DIR", "/mnt/media/YouTube"))
+
+@app.post("/api/v1/youtube/download")
+async def youtube_download(req: Request):
+    _require_ui_api_key(req)
+    body = await req.json()
+    url = (body.get("url") or "").strip()
+    title = (body.get("title") or "").strip()
+    subfolder = (body.get("subfolder") or "").strip().strip("/")
+    jellyfin_rescan = bool(body.get("jellyfin_rescan", True))
+
+    if not url:
+        raise HTTPException(status_code=400, detail="url is required")
+
+    dest = YOUTUBE_BASE_DIR / subfolder if subfolder else YOUTUBE_BASE_DIR
+    dest.mkdir(parents=True, exist_ok=True)
+
+    output_tpl = str(dest / (f"{title}.%(ext)s" if title else "%(title)s.%(ext)s"))
+    ytdlp_bin = shutil.which("yt-dlp") or "yt-dlp"
+    ytdlp_cmd = [
+        ytdlp_bin,
+        "--format", "bestvideo+bestaudio/best/mp4/m4a/91/bestaudio",
+        "--merge-output-format", "mp4",
+        "--output", output_tpl,
+        url,
+    ]
+    entry_id = secrets.token_hex(6)
+    entry: Dict[str, Any] = {
+        "id": entry_id,
+        "url": url,
+        "title": title or "",
+        "subfolder": subfolder,
+        "dest": str(dest),
+        "status": "queued",
+        "error": None,
+        "created_at": time.time(),
+    }
+
+    async with _YT_QUEUE_LOCK:
+        _YT_QUEUE.append(entry)
+        if len(_YT_QUEUE) > 20:
+            _YT_QUEUE.pop(0)
+
+    async def _run():
+        async with _YT_QUEUE_LOCK:
+            entry["status"] = "downloading"
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *ytdlp_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            _, stderr = await proc.communicate()
+            if proc.returncode == 0:
+                async with _YT_QUEUE_LOCK:
+                    entry["status"] = "done"
+                if jellyfin_rescan:
+                    asyncio.create_task(_jellyfin_refresh_yt())
+            else:
+                err = (stderr.decode(errors="replace") or "")[-400:].strip()
+                async with _YT_QUEUE_LOCK:
+                    entry["status"] = "failed"
+                    entry["error"] = err
+        except Exception as exc:
+            async with _YT_QUEUE_LOCK:
+                entry["status"] = "failed"
+                entry["error"] = str(exc)
+
+    asyncio.create_task(_run())
+    return JSONResponse({"ok": True, "id": entry_id})
+
+@app.get("/api/v1/youtube/queue")
+async def youtube_queue(req: Request):
+    _require_ui_api_key(req)
+    async with _YT_QUEUE_LOCK:
+        return JSONResponse(list(reversed(_YT_QUEUE)))
+
+@app.get("/api/v1/youtube/check")
+async def youtube_check(req: Request, url: str = ""):
+    _require_ui_api_key(req)
+    import re
+    m = re.search(r'[?&]v=([a-zA-Z0-9_-]{11})', url)
+    if not m:
+        return JSONResponse({"exists": False, "path": None})
+    video_id = m.group(1)
+    needle = f"[{video_id}]"
+    if YOUTUBE_BASE_DIR.exists():
+        for root, _dirs, files in os.walk(YOUTUBE_BASE_DIR):
+            for fname in files:
+                if needle in fname:
+                    return JSONResponse({"exists": True, "path": str(Path(root) / fname)})
+    return JSONResponse({"exists": False, "path": None})
+
+@app.post("/api/v1/youtube/playlist-info")
+async def youtube_playlist_info(req: Request):
+    _require_ui_api_key(req)
+    body = await req.json()
+    url = (body.get("url") or "").strip()
+    if not url:
+        raise HTTPException(status_code=400, detail="url is required")
+
+    ytdlp_bin = shutil.which("yt-dlp") or "yt-dlp"
+    cmd = [ytdlp_bin, "--flat-playlist", "-j", "--no-warnings", "--no-progress", url]
+    if YTDLP_COOKIES_FILE and Path(YTDLP_COOKIES_FILE).exists():
+        cmd += ["--cookies", YTDLP_COOKIES_FILE]
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=30)
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=408, detail="Playlist info timed out (30s)")
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+    entries = []
+    playlist_title = ""
+    for line in stdout.decode(errors="replace").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            data = json.loads(line)
+            if not playlist_title:
+                playlist_title = (data.get("playlist_title") or data.get("playlist") or "").strip()
+            eid = (data.get("id") or "").strip()
+            etitle = (data.get("title") or eid).strip()
+            if eid:
+                entries.append({"id": eid, "title": etitle})
+        except Exception:
+            continue
+
+    return JSONResponse({"title": playlist_title, "count": len(entries), "entries": entries})
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+# ── Jellyfin library ownership check ─────────────────────────────────────────
+
+@app.post("/api/v1/jellyfin/check-titles")
+async def jellyfin_check_titles(req: Request):
+    """
+    Check which titles from a list are already in the Jellyfin library cache.
+    Body: { "titles": ["Title 1", "Title 2", ...] }  (up to 50)
+    Returns: { results: { "Title 1": true/false, ... }, library_size, last_fetch }
+    """
+    _require_ui_api_key(req)
+    try:
+        body = await req.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+    titles = (body or {}).get("titles") or []
+    if not isinstance(titles, list):
+        raise HTTPException(status_code=400, detail="titles must be a list")
+    titles = titles[:50]
+
+    async with _JELLYFIN_LIBRARY_LOCK:
+        lib = set(_JELLYFIN_LIBRARY)
+        last = _JELLYFIN_LIBRARY_LAST_FETCH
+
+    results: Dict[str, bool] = {}
+    for title in titles:
+        norm = _normalise_title(str(title))
+        if not norm or len(norm) < 2:
+            results[title] = False
+            continue
+        if norm in lib:
+            results[title] = True
+            continue
+        # Fuzzy: handle year-suffix differences (library has "title 2008", query has "title")
+        found = any(
+            (e.startswith(norm + " ") or norm.startswith(e + " ") or e == norm)
+            for e in lib if e
+        )
+        results[title] = found
+
+    return JSONResponse({"results": results, "library_size": len(lib), "last_fetch": last})
+
+
+@app.get("/api/v1/jellyfin/library-status")
+async def jellyfin_library_status():
+    """Return current library cache size and age. No auth required."""
+    async with _JELLYFIN_LIBRARY_LOCK:
+        size = len(_JELLYFIN_LIBRARY)
+        last = _JELLYFIN_LIBRARY_LAST_FETCH
+    ago = round((time.time() - last) / 60.0, 1) if last else None
+    return JSONResponse({"library_size": size, "last_fetch": last, "last_fetch_ago_minutes": ago})
+
+
+@app.post("/api/v1/jellyfin/refresh-library")
+async def jellyfin_refresh_library(req: Request):
+    """Trigger an immediate library cache refresh. Returns updated status."""
+    _require_ui_api_key(req)
+    await _refresh_jellyfin_library()
+    async with _JELLYFIN_LIBRARY_LOCK:
+        size = len(_JELLYFIN_LIBRARY)
+        last = _JELLYFIN_LIBRARY_LAST_FETCH
+    return JSONResponse({"ok": True, "library_size": size, "last_fetch": last})
+
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+# ── Metadata detection ────────────────────────────────────────────────────────
+# Requires TMDB_API_KEY env var for Stage 2 TMDb verification (optional).
+
+_QUALITY_TAGS = re.compile(
+    r"\b(2160p|4k|uhd|1080p|720p|480p|bluray|blu-ray|bdrip|brrip|web[-\s]?dl|webrip|"
+    r"hdtv|hdrip|dvdrip|dvdscr|hdcam|cam|ts|hdr|dv|sdr|remux|"
+    r"x264|x265|h264|h265|hevc|avc|xvid|divx|"
+    r"aac|dts|ac3|mp3|atmos|truehd|dd5\.?1|ddp5\.?1|"
+    r"extended|theatrical|directors\.cut|remastered|proper|"
+    r"multi|dubbed|subbed|\d+bit|\d+ch)\b",
+    re.IGNORECASE,
+)
+_GROUP_TAG   = re.compile(r"-[A-Za-z0-9]{2,10}$")
+_SEASON_EP   = re.compile(r"\bS(\d{1,2})E(\d{1,2})\b", re.IGNORECASE)
+_SEASON_ONLY = re.compile(r"\bS(\d{1,2})\b(?!E\d)", re.IGNORECASE)
+# Year must NOT be immediately preceded by digits (catches "10bit", "8bit", port numbers etc.)
+_YEAR_RE     = re.compile(r"(?<!\d)(19\d{2}|20\d{2})(?!\d)")
+
+_AUDIO_EXTS     = re.compile(r"\b(flac|mp3|aac|wav|ogg|opus|alac|m4a|m4b|wma|aiff?)\b", re.IGNORECASE)
+_AUDIOBOOK_NOISE = re.compile(
+    r"\b(unabridged|abridged|audiobook|audio\s*book|part\s*\d+|book\s*\d+|vol(?:ume)?\s*\d+|narrator[:\s]\S+)\b",
+    re.IGNORECASE,
+)
+_AUDIO_KEYWORDS = re.compile(r"\b(discography|album|soundtrack|ost|singles|collection)\b", re.IGNORECASE)
+
+def _parse_filename(filename: str) -> Dict[str, Any]:
+    """
+    Stage 1: pure-regex metadata extraction.
+    Returns dict with: title, year, season, episode, type, confidence (low/medium/high)
+    """
+    # Strip extension
+    name = re.sub(r"\.[a-zA-Z0-9]{2,5}$", "", (filename or "").strip())
+
+    # Bug C fix: strip -GROUP suffix from raw name before normalising separators
+    name = _GROUP_TAG.sub("", name)
+
+    # Normalise separators
+    norm = name.replace(".", " ").replace("_", " ").replace("-", " ")
+
+    # Extract season/episode
+    season: Optional[int] = None
+    episode: Optional[int] = None
+    m_so = None
+    m_se = _SEASON_EP.search(norm)
+    if m_se:
+        season  = int(m_se.group(1))
+        episode = int(m_se.group(2))
+    else:
+        # Season-only (e.g. S01.COMPLETE) — no episode number
+        m_so = _SEASON_ONLY.search(norm)
+        if m_so:
+            season = int(m_so.group(1))
+
+    # Extract year
+    year: Optional[int] = None
+    m_yr = _YEAR_RE.search(norm)
+    if m_yr:
+        year = int(m_yr.group(1))
+
+    # Strip everything from the year / S##E## / S## onwards, and remove quality tags
+    cutoff = len(norm)
+    if m_yr:
+        cutoff = min(cutoff, m_yr.start())
+    if m_se:
+        cutoff = min(cutoff, m_se.start())
+    if m_so:                                          # Bug 1: use season-only match for cutoff
+        cutoff = min(cutoff, m_so.start())
+    title_raw = norm[:cutoff]
+    title_raw = _QUALITY_TAGS.sub(" ", title_raw)
+    title_raw = re.sub(r"\bSEASON\s*\d+\b", " ", title_raw, flags=re.IGNORECASE)
+    title_raw = re.sub(r"\bCOMPLETE\b", " ", title_raw, flags=re.IGNORECASE)
+    title_raw = re.sub(r"\bS\d{1,2}\b", " ", title_raw, flags=re.IGNORECASE)  # Bug 2: bare S01 tokens
+    title_raw = re.sub(r"\s{2,}", " ", title_raw).strip(" -([{")
+
+    # Bug A fix: detect music BEFORE tv/movie
+    is_audio_ext = bool(_AUDIO_EXTS.search(filename))
+    if is_audio_ext or _AUDIO_KEYWORDS.search(norm):
+        media_type = "music"
+        # Strip audiobook noise words from title
+        title_raw = _AUDIOBOOK_NOISE.sub(" ", title_raw)
+        title_raw = re.sub(r"\s{2,}", " ", title_raw).strip(" -([{")
+        # For m4b audiobooks: detect "Author - Title" from original name (before normalisation)
+        if is_audio_ext and re.search(r"\.m4b$", filename, re.IGNORECASE):
+            # `name` still has the original separator characters (dashes preserved)
+            name_stripped = re.sub(r"\.[a-zA-Z0-9]{2,5}$", "", (filename or "").strip())
+            name_stripped = _GROUP_TAG.sub("", name_stripped)
+            m_sep = re.search(r"\s+-\s+", name_stripped)
+            if m_sep:
+                raw_author = name_stripped[:m_sep.start()].replace(".", " ").replace("_", " ").strip()
+                raw_book   = name_stripped[m_sep.end():].replace(".", " ").replace("_", " ").strip()
+                # Strip year and noise from book part
+                raw_book = _QUALITY_TAGS.sub(" ", raw_book)
+                raw_book = _AUDIOBOOK_NOISE.sub(" ", raw_book)
+                m_yr2 = _YEAR_RE.search(raw_book)
+                if m_yr2:
+                    raw_book = raw_book[:m_yr2.start()]
+                raw_book = re.sub(r"\s{2,}", " ", raw_book).strip(" -([{")
+                if raw_author and raw_book:
+                    title_raw = f"{raw_author} - {raw_book}"
+    elif season is not None:
+        media_type = "tv"
+    else:
+        media_type = "movie"
+
+    # Confidence
+    has_year    = year is not None
+    has_season  = season is not None
+    title_words = len(title_raw.split()) if title_raw else 0
+
+    # Bug B fix: noise check — all words 3 chars or fewer → low confidence
+    if title_words >= 1 and all(len(w) <= 3 for w in title_raw.split()):
+        confidence = "low"
+    elif title_words >= 1 and (has_year or has_season):
+        confidence = "high"
+    elif title_words >= 1:
+        confidence = "medium"
+    else:
+        confidence = "low"
+
+    return {
+        "title":      title_raw or "",
+        "year":       year,
+        "season":     season,
+        "episode":    episode,
+        "type":       media_type,
+        "confidence": confidence,
+    }
+
+
+@app.post("/api/v1/detect-metadata")
+async def detect_metadata(req: Request):
+    """
+    Detect title/year/season/type from a torrent filename.
+
+    Stage 1 — local regex (always runs).
+    Stage 2 — TMDb verification (only when TMDB_API_KEY is set and confidence
+              is medium or high).
+
+    Body: { "filename": "<torrent name or path>" }
+    Returns: { title, year, season, episode, type, confidence,
+               tmdb_id, tmdb_poster, tmdb_overview }
+    """
+    _require_ui_api_key(req)
+    try:
+        body = await req.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    filename = (((body or {}).get("filename") or "")).strip()
+    if not filename:
+        raise HTTPException(status_code=400, detail="filename is required")
+
+    # Use just the last path component
+    filename = Path(filename).name or filename
+
+    parsed = _parse_filename(filename)
+    result: Dict[str, Any] = {
+        "title":        parsed["title"],
+        "year":         parsed["year"],
+        "season":       parsed["season"],
+        "episode":      parsed["episode"],
+        "type":         parsed["type"],
+        "confidence":   parsed["confidence"],
+        "tmdb_id":      None,
+        "tmdb_poster":  None,
+        "tmdb_overview": None,
+    }
+
+    # Stage 2 — TMDb verification
+    if TMDB_API_KEY and parsed["confidence"] in ("medium", "high") and parsed["title"]:
+        try:
+            import asyncio as _asyncio
+            q = parsed["title"]
+            yr = parsed["year"]
+
+            if parsed["type"] == "tv":
+                candidates, _ = await _asyncio.wait_for(
+                    _tmdb_search_tv(q), timeout=3.0
+                )
+                hit = next(
+                    (c for c in candidates if (c.get("vote_count") or 0) > 10),
+                    candidates[0] if candidates else None,
+                )
+                if hit:
+                    result["tmdb_id"]       = hit.get("id")
+                    result["title"]         = (hit.get("name") or parsed["title"]).strip()
+                    raw_yr = (hit.get("first_air_date") or "")[:4]
+                    if raw_yr.isdigit():
+                        result["year"] = int(raw_yr)
+                    result["confidence"]    = "high"
+                    result["tmdb_overview"] = (hit.get("overview") or "")[:200]
+                    poster = hit.get("poster_path")
+                    if poster:
+                        result["tmdb_poster"] = f"https://image.tmdb.org/t/p/w92{poster}"
+            else:
+                candidates, _ = await _asyncio.wait_for(
+                    _tmdb_search_movie(q, yr), timeout=3.0
+                )
+                hit = next(
+                    (c for c in candidates if (c.get("vote_count") or 0) > 10),
+                    candidates[0] if candidates else None,
+                )
+                if hit:
+                    result["tmdb_id"]       = hit.get("id")
+                    result["title"]         = (hit.get("title") or parsed["title"]).strip()
+                    raw_yr = (hit.get("release_date") or "")[:4]
+                    if raw_yr.isdigit():
+                        result["year"] = int(raw_yr)
+                    result["confidence"]    = "high"
+                    result["tmdb_overview"] = (hit.get("overview") or "")[:200]
+                    poster = hit.get("poster_path")
+                    if poster:
+                        result["tmdb_poster"] = f"https://image.tmdb.org/t/p/w92{poster}"
+        except Exception:
+            pass  # TMDb failure is non-fatal; return Stage 1 result
+
+    return JSONResponse(result)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ─── Storage stats ───────────────────────────────────────────────────────────
+_storage_stats_cache: Dict[str, Any] = {"data": None, "ts": 0.0}
+_STORAGE_CACHE_TTL = 300  # 5 minutes
+
+@app.get("/api/v1/storage/stats")
+async def storage_stats(req: Request):
+    authenticate_request(req)
+    now = time.time()
+    if _storage_stats_cache["data"] and (now - _storage_stats_cache["ts"]) < _STORAGE_CACHE_TTL:
+        return JSONResponse(_storage_stats_cache["data"])
+
+    result: Dict[str, Any] = {}
+    media_root = Path("/mnt/media")
+    try:
+        usage = shutil.disk_usage(str(media_root))
+        result["total_gb"]      = round(usage.total / (1024 ** 3), 1)
+        result["total_used_gb"] = round(usage.used  / (1024 ** 3), 1)
+        result["total_free_gb"] = round(usage.free  / (1024 ** 3), 1)
+    except Exception:
+        result["total_gb"] = result["total_used_gb"] = result["total_free_gb"] = 0
+
+    for subdir, key in [("Music", "music_gb"), ("TV", "tv_gb"), ("Movies", "movies_gb")]:
+        try:
+            p = media_root / subdir
+            if p.exists():
+                proc = await asyncio.create_subprocess_exec(
+                    "du", "-sb", str(p),
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=30)
+                result[key] = round(int(stdout.split()[0]) / (1024 ** 3), 1)
+            else:
+                result[key] = 0
+        except Exception:
+            result[key] = 0
+
+    _storage_stats_cache["data"] = result
+    _storage_stats_cache["ts"]   = now
+    return JSONResponse(result)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ─── Jellyfin recently added ─────────────────────────────────────────────────
+_recently_added_cache: Dict[str, Any] = {"data": None, "ts": 0.0}
+_RECENTLY_ADDED_TTL = 300  # 5 minutes
+
+@app.get("/api/v1/jellyfin/recently-added")
+async def jellyfin_recently_added(req: Request):
+    authenticate_request(req)
+    now = time.time()
+    if _recently_added_cache["data"] is not None and (now - _recently_added_cache["ts"]) < _RECENTLY_ADDED_TTL:
+        return JSONResponse(_recently_added_cache["data"])
+
+    if not JELLYFIN_URL or not JELLYFIN_API_KEY or not httpx:
+        return JSONResponse({"items": []})
+
+    try:
+        base = JELLYFIN_URL.rstrip("/")
+        params = {
+            "api_key": JELLYFIN_API_KEY,
+            "SortBy": "DateCreated,SortName",
+            "SortOrder": "Descending",
+            "Recursive": "true",
+            "Limit": "8",
+            "IncludeItemTypes": "Movie,Series",
+            "Fields": "Name,ProductionYear,Type,ImageTags",
+        }
+        async with httpx.AsyncClient(timeout=8.0, trust_env=False) as client:
+            resp = await client.get(f"{base}/Items", params=params)
+        raw = resp.json() if resp.status_code == 200 else {}
+        items_raw = raw.get("Items") or []
+        items = []
+        for it in items_raw:
+            item_id = it.get("Id") or ""
+            image_tags = it.get("ImageTags") or {}
+            thumb_url = None
+            if item_id and image_tags.get("Primary"):
+                thumb_url = f"{base}/Items/{item_id}/Images/Primary?api_key={JELLYFIN_API_KEY}&maxHeight=80&quality=70"
+            items.append({
+                "name": it.get("Name") or "",
+                "year": it.get("ProductionYear") or None,
+                "type": (it.get("Type") or "").lower(),
+                "thumb_url": thumb_url,
+            })
+        result = {"items": items}
+        _recently_added_cache["data"] = result
+        _recently_added_cache["ts"] = now
+        return JSONResponse(result)
+    except Exception:
+        return JSONResponse({"items": []})
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ─── Navidrome recently added ─────────────────────────────────────────────────
+_nd_recently_added_cache: Dict[str, Any] = {"data": None, "ts": 0.0}
+_ND_RECENTLY_ADDED_TTL = 300  # 5 minutes
+
+@app.get("/api/v1/navidrome/recently-added")
+async def navidrome_recently_added(req: Request):
+    authenticate_request(req)
+    now = time.time()
+    if _nd_recently_added_cache["data"] is not None and (now - _nd_recently_added_cache["ts"]) < _ND_RECENTLY_ADDED_TTL:
+        return JSONResponse(_nd_recently_added_cache["data"])
+
+    params = _navidrome_auth_params()
+    if not params or not httpx:
+        return JSONResponse({"albums": []})
+
+    try:
+        base = NAVIDROME_URL.rstrip("/")
+        req_params = {**params, "type": "newest", "size": "8"}
+        async with httpx.AsyncClient(timeout=8.0, trust_env=False) as client:
+            resp = await client.get(f"{base}/rest/getAlbumList2", params=req_params)
+        if resp.status_code != 200:
+            return JSONResponse({"albums": []})
+        raw = resp.json()
+        album_list = ((raw.get("subsonic-response") or {}).get("albumList2") or {}).get("album") or []
+        albums = []
+        for al in album_list:
+            al_id = al.get("id") or al.get("coverArt") or ""
+            cover_url = None
+            if al_id:
+                cover_params = urllib.parse.urlencode({**params, "id": al_id, "size": "64"})
+                cover_url = f"{base}/rest/getCoverArt?{cover_params}"
+            albums.append({
+                "name":        al.get("name") or al.get("album") or "",
+                "artist":      al.get("artist") or al.get("artistName") or "",
+                "year":        al.get("year") or None,
+                "cover_url":   cover_url,
+                "play_count":  al.get("playCount") or 0,
+                "last_played": al.get("played") or None,  # ISO date string or None
+            })
+        result = {"albums": albums}
+        _nd_recently_added_cache["data"] = result
+        _nd_recently_added_cache["ts"] = now
+        return JSONResponse(result)
+    except Exception:
+        return JSONResponse({"albums": []})
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ─── Jellyfin Now Playing ────────────────────────────────────────────────────
+@app.get("/api/v1/jellyfin/now-playing")
+async def jellyfin_now_playing(req: Request):
+    _require_ui_api_key(req)
+    if not JELLYFIN_URL or not JELLYFIN_API_KEY or not httpx:
+        return JSONResponse({"sessions": []})
+    try:
+        base = JELLYFIN_URL.rstrip("/")
+        headers = {"X-Emby-Token": JELLYFIN_API_KEY, "X-MediaBrowser-Token": JELLYFIN_API_KEY}
+        async with httpx.AsyncClient(timeout=5.0, trust_env=False) as client:
+            r = await client.get(f"{base}/Sessions", headers=headers)
+        if r.status_code >= 400:
+            return JSONResponse({"sessions": []})
+        sessions_raw = r.json() or []
+        playing = []
+        for s in sessions_raw:
+            item = s.get("NowPlayingItem")
+            if not item:
+                continue
+            play_state = s.get("PlayState") or {}
+            pos_ticks = play_state.get("PositionTicks") or 0
+            dur_ticks = item.get("RunTimeTicks") or 0
+            pos_s = int(pos_ticks / 10_000_000) if pos_ticks else 0
+            dur_s = int(dur_ticks / 10_000_000) if dur_ticks else 0
+            pct = min(100, int(pos_s / dur_s * 100)) if dur_s else 0
+
+            transcode_info = s.get("TranscodingInfo")
+            play_method_raw = play_state.get("PlayMethod") or ""
+            if transcode_info:
+                play_method = "Transcode"
+            elif play_method_raw == "DirectStream":
+                play_method = "Remux"
+            else:
+                play_method = "Direct"
+
+            item_id = item.get("Id") or ""
+            thumb_url = None
+            if item_id:
+                thumb_url = f"{base}/Items/{item_id}/Images/Primary?api_key={JELLYFIN_API_KEY}&maxHeight=80&quality=70"
+
+            playing.append({
+                "title": item.get("Name") or "",
+                "subtitle": item.get("SeriesName") or item.get("AlbumArtist") or "",
+                "type": (item.get("Type") or "").lower(),
+                "position_s": pos_s,
+                "duration_s": dur_s,
+                "progress_pct": pct,
+                "play_method": play_method,
+                "user": s.get("UserName") or "",
+                "thumb_url": thumb_url,
+            })
+        return JSONResponse({"sessions": playing})
+    except Exception as e:
+        logger.warning("jellyfin_now_playing error: %s", e)
+        return JSONResponse({"sessions": []})
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ─── YouTube folder list ──────────────────────────────────────────────────────
+@app.get("/api/v1/youtube/folders")
+async def youtube_folders(req: Request):
+    _require_ui_api_key(req)
+    folders = []
+    try:
+        if YOUTUBE_BASE_DIR.exists():
+            for child in sorted(YOUTUBE_BASE_DIR.iterdir()):
+                if child.is_dir() and not child.name.startswith("."):
+                    folders.append(child.name)
+    except Exception:
+        pass
+    return JSONResponse({"folders": folders})
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ─── Music track-info (explicit/clean detection) ──────────────────────────────
+_track_info_cache: Dict[str, Any] = {}  # video_id -> {"data": {...}, "ts": float}
+_TRACK_INFO_TTL = 3600  # 1 hour
+
+_EXPLICIT_TITLE_RE = re.compile(r'\(explicit\)|[\[\(]explicit[\]\)]|\bexplicit\s+version\b|\s[-–]\s*explicit\b', re.IGNORECASE)
+_CLEAN_TITLE_RE    = re.compile(r'\(clean\)|[\[\(]clean[\]\)]|\bclean\s+version\b|\s[-–]\s*clean\b|\bradio\s+edit\b', re.IGNORECASE)
+
+@app.get("/api/v1/music/track-info")
+async def music_track_info(req: Request, video_id: str = ""):
+    _require_ui_api_key(req)
+    video_id = (video_id or "").strip()
+    if not video_id or not re.match(r'^[A-Za-z0-9_\-]{6,20}$', video_id):
+        raise HTTPException(status_code=400, detail="valid video_id required")
+
+    now = time.time()
+    cached = _track_info_cache.get(video_id)
+    if cached and (now - cached["ts"]) < _TRACK_INFO_TTL:
+        return JSONResponse(cached["data"])
+
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    ytdlp_bin = shutil.which("yt-dlp") or "yt-dlp"
+    cmd = [ytdlp_bin, "--dump-json", "--no-download", "--quiet", url]
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10.0)
+        info = json.loads(stdout) if stdout else {}
+    except Exception:
+        return JSONResponse({"explicit": None})
+
+    title      = (info.get("title") or "")
+    age_limit  = info.get("age_limit") or 0
+    tags       = [t.lower() for t in (info.get("tags") or [])]
+
+    explicit: Optional[bool] = None
+    if age_limit > 0 or _EXPLICIT_TITLE_RE.search(title) or "explicit" in tags:
+        explicit = True
+    elif _CLEAN_TITLE_RE.search(title) or "clean" in tags:
+        explicit = False
+
+    result = {"explicit": explicit}
+    _track_info_cache[video_id] = {"data": result, "ts": now}
+    return JSONResponse(result)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ─── User settings ───────────────────────────────────────────────────────────
+import re as _re
+_SAFE_ID_RE = _re.compile(r"^[A-Za-z0-9\-]{8,64}$")
+
+def _settings_path(jellyfin_id: str) -> Path:
+    jid = (jellyfin_id or "").strip()
+    if not _SAFE_ID_RE.match(jid):
+        raise ValueError(f"Invalid jellyfin_id: '{jid}'")
+    return USER_DATA_DIR / jid / "settings.json"
+
+@app.get("/api/v1/user/settings")
+async def get_user_settings(req: Request):
+    claims = require_auth(req)
+    jellyfin_id = claims.get("jellyfin_id") or ""
+    if not jellyfin_id:
+        raise HTTPException(status_code=400, detail="JWT missing jellyfin_id claim")
+    try:
+        path = _settings_path(jellyfin_id)
+        if not path.exists():
+            return JSONResponse({})
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return JSONResponse({
+            "api_key": (data.get("api_key") or "").strip(),
+            "nd_user":  (data.get("nd_user")  or "").strip(),
+            "nd_pass":  (data.get("nd_pass")  or "").strip(),
+        })
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception:
+        return JSONResponse({})
+
+@app.post("/api/v1/user/settings")
+async def save_user_settings(req: Request):
+    claims = require_auth(req)
+    jellyfin_id = claims.get("jellyfin_id") or ""
+    if not jellyfin_id:
+        raise HTTPException(status_code=400, detail="JWT missing jellyfin_id claim")
+    try:
+        body = await req.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    # Validate input lengths
+    api_key = (body.get("api_key") or "")
+    nd_user  = (body.get("nd_user")  or "")
+    nd_pass  = (body.get("nd_pass")  or "")
+    if len(api_key) > 256 or len(nd_user) > 128 or len(nd_pass) > 512:
+        raise HTTPException(status_code=400, detail="Input too long")
+
+    try:
+        path = _settings_path(jellyfin_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # Merge with existing data so partial updates don't clobber other fields
+        existing: Dict[str, Any] = {}
+        if path.exists():
+            try:
+                existing = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                existing = {}
+        if "api_key" in body:
+            existing["api_key"] = api_key.strip()
+        if "nd_user" in body:
+            existing["nd_user"] = nd_user.strip()
+        if "nd_pass" in body:
+            existing["nd_pass"] = nd_pass.strip()
+        path.write_text(json.dumps(existing), encoding="utf-8")
+        return JSONResponse({"ok": True})
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+# ─────────────────────────────────────────────────────────────────────────────
 
 from pathlib import Path as _Path
 _UI_DIR = _Path(__file__).resolve().parent / "static"
