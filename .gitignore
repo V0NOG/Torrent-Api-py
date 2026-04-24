@@ -1,5 +1,32 @@
+# Secrets
+.env
+.env.*
+backend/.env
+frontend/.env
+app/.env
+
+# Python
+venv/
 .venv/
-api-py/
 __pycache__/
 *.pyc
-queue_state.json
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+
+# Node
+node_modules/
+*/node_modules/
+
+# Builds
+dist/
+build/
+
+# OS / logs / temp
+.DS_Store
+*.log
+*.tmp
+*.bak
+*.swp
+*.swo
